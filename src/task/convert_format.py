@@ -10,6 +10,30 @@ import torch
 from util.rot_util import torch_quaternion_to_matrix, torch_matrix_to_quaternion
 
 
+def resolve_bodex_scene_cfg_path(scene_path_rel: str, data_file: str) -> str:
+    """
+    BODex stores scene_path relative to .../src/curobo/content/. DexGraspBench is
+    often run from another cwd, so relative paths must be anchored to that root.
+    """
+    scene_path_rel = os.path.normpath(str(scene_path_rel))
+    if os.path.isabs(scene_path_rel) and os.path.isfile(scene_path_rel):
+        return scene_path_rel
+    if os.path.isfile(scene_path_rel):
+        return os.path.abspath(scene_path_rel)
+    marker = os.path.normpath("src/curobo/content")
+    norm_data = os.path.normpath(data_file)
+    idx = norm_data.find(marker)
+    if idx != -1:
+        root = norm_data[: idx + len(marker)]
+        candidate = os.path.normpath(os.path.join(root, scene_path_rel))
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        f"Scene cfg not found: {scene_path_rel!r} (cwd={os.getcwd()}). "
+        f"Expected under BODex content root inferred from data file: {data_file!r}"
+    )
+
+
 def load_scene_cfg(scene_path):
     scene_cfg = np.load(scene_path, allow_pickle=True).item()
 
@@ -33,7 +57,16 @@ def BODex(params):
     robot_pose = raw_data["robot_pose"][0]
     new_data = {}
 
-    scene_path = raw_data["scene_path"][0].split("src/curobo/content/")[1]
+    scene_path_raw = raw_data["scene_path"]
+    if isinstance(scene_path_raw, (list, tuple, np.ndarray)):
+        scene_path_raw = scene_path_raw[0]
+    scene_path_raw = str(scene_path_raw)
+    scene_path = (
+        scene_path_raw.split("src/curobo/content/")[1]
+        if "src/curobo/content/" in scene_path_raw
+        else scene_path_raw
+    )
+    scene_path = resolve_bodex_scene_cfg_path(scene_path, data_file)
     scene_cfg = load_scene_cfg(scene_path)
     obj_name = scene_cfg["task"]["obj_name"]
     new_data["obj_scale"] = scene_cfg["scene"][obj_name]["scale"][0]

@@ -1,5 +1,7 @@
 skip: True
-n_worker: 48    
+n_worker: 48
+# Used by np.random / random (e.g. task.max_num subsampling). Override per run for different picks, e.g. seed=$RANDOM
+seed: 12
 setting: fc # or tabletop
 
 exp_name: debug

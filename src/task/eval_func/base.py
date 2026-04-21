@@ -259,4 +259,8 @@ class BaseEval:
             if key in self.grasp_data.keys():
                 eval_results[key] = self.grasp_data[key]
         np.save(eval_npy_path, eval_results)
+
+        # In interactive debug mode, keep the MuJoCo window alive until user closes it.
+        if self.configs.task.debug_viewer:
+            self.mj_ho.wait_until_viewer_closed()
         return

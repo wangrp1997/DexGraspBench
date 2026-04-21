@@ -1,5 +1,5 @@
 import os
-import pdb
+import time
 
 import trimesh
 import numpy as np
@@ -84,7 +84,6 @@ class MjHO:
         if debug_viewer:
             self.debug_viewer = mujoco.viewer.launch_passive(self.model, self.data)
             self.debug_viewer.sync()
-            pdb.set_trace()
 
         if debug_render:
             self.debug_render = mujoco.Renderer(self.model, 480, 640)
@@ -291,14 +290,31 @@ class MjHO:
     def control_hand_step(self, step_inner):
         for _ in range(step_inner):
             mujoco.mj_step(self.model, self.data)
+            if self.debug_viewer is not None:
+                self.debug_viewer.sync()
+                # Slow down to interactive speed so the viewer is observable.
+                time.sleep(self.model.opt.timestep)
 
         if self.debug_render is not None:
             self.debug_render.update_scene(self.data, "closeup", self.debug_options)
             pixels = self.debug_render.render()
             self.debug_images.append(pixels)
 
-        if self.debug_viewer is not None:
-            raise NotImplementedError
+        return
+
+    def wait_until_viewer_closed(self):
+        """Block in debug mode until the user closes the MuJoCo viewer window."""
+        if self.debug_viewer is None:
+            return
+        # launch_passive(run_physics_thread=False) does not integrate in the GUI thread;
+        # MuJoCo's passive-viewer examples call mj_step in the main loop with viewer.lock().
+        # Only sync()-ing here leaves nothing driving the simulate loop, so the window can
+        # appear frozen once the scripted trajectory (through lift) finishes.
+        while self.debug_viewer.is_running():
+            with self.debug_viewer.lock():
+                mujoco.mj_step(self.model, self.data)
+            self.debug_viewer.sync()
+            time.sleep(0.01)
         return
 
 
