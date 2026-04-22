@@ -129,7 +129,23 @@ class BaseEval:
             pre_obj_qpos[2] += 0.1
 
         # Detailed simulation methods for testing
-        self._simulate_under_extforce_details(pre_obj_qpos)
+        internal_fc_passed = self._simulate_under_extforce_details(pre_obj_qpos)
+        if internal_fc_passed is False:
+            # If detailed simulation already judged failure (e.g. no contact or
+            # force-stage instability), keep failure status but still report the
+            # real current delta values instead of sentinel constants.
+            latter_obj_qpos = self.mj_ho.get_obj_pose()
+            delta_pos, delta_angle = np_get_delta_qpos(pre_obj_qpos, latter_obj_qpos)
+            if self.configs.task.debug_viewer or self.configs.task.debug_render:
+                print(False, delta_pos, delta_angle)
+                if self.configs.task.debug_render:
+                    debug_path = self.input_npy_path.replace(
+                        self.configs.grasp_dir, self.configs.task.debug_dir
+                    ).replace(".npy", ".gif")
+                    os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+                    imageio.mimsave(debug_path, self.mj_ho.debug_images)
+                    print("Save GIF to ", debug_path)
+            return False, delta_pos, delta_angle
 
         # Compare the resulted object pose
         latter_obj_qpos = self.mj_ho.get_obj_pose()

@@ -1,0 +1,14 @@
+xml_path: assets/hand/botyard/right_hand_noforearm.xml # Botyard 纯手（无前臂）MuJoCo 手模型 XML 路径
+mocap: True # 纯手模式（无机械臂）
+exclude_table_contact: [] # 纯手模型无前臂，可不额外忽略 table 接触 body
+color: [0.863157, 0.0865002, 0.0802199, 1.0] # 手的可视化颜色 RGBA
+finger_prefix: ['ff', 'mf', 'rf', 'lf', 'th'] # 五指前缀，对应 ff*/mf*/rf*/lf*/th* body 名
+valid_body_name: [ # 允许参与评估（接触/力闭合）的 body 名称
+    'pmbase', # 手掌等效 body（palm 几何挂在 pmbase 上）
+    'ffbase', 'ffproximal', 'ffmiddle', 'ffdistal', # 食指
+    'mfbase', 'mfproximal', 'mfmiddle', 'mfdistal', # 中指
+    'rfbase', 'rfproximal', 'rfmiddle', 'rfdistal', # 无名指
+    'lfbase', 'lfproximal', 'lfmiddle', 'lfdistal', # 小指
+    'thbase', 'thproximal', 'thmiddle', 'thdistal', # 拇指
+]
+tip_body_name: ['ffdistal', 'mfdistal', 'rfdistal', 'lfdistal', 'thdistal'] # 指尖 body（tip-only 指标使用）

@@ -2,12 +2,156 @@ import os
 from glob import glob
 import logging
 import multiprocessing
+import xml.etree.ElementTree as ET
 
 import numpy as np
+import transforms3d.euler as te
 from transforms3d import quaternions as tq
 import torch
 
 from util.rot_util import torch_quaternion_to_matrix, torch_matrix_to_quaternion
+
+
+_BOTYARD_CACHE = {}
+
+
+def _parse_csv_floats(text, expected_len):
+    vals = [float(x.strip()) for x in str(text).split(",")]
+    if len(vals) != expected_len:
+        raise ValueError(f"expect {expected_len} floats, got {len(vals)}")
+    return vals
+
+
+def _find_mujoco_joint_parent_map(xml_path):
+    """
+    Return a mapping: joint_name -> parent_body_name from MuJoCo XML hierarchy.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    parent_map = {}
+
+    def walk_body(body_elem):
+        body_name = body_elem.get("name", "")
+        for child in body_elem:
+            if child.tag == "joint":
+                jname = child.get("name")
+                if jname:
+                    parent_map[jname] = body_name
+            elif child.tag == "body":
+                walk_body(child)
+
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        return parent_map
+    for body in worldbody.findall("body"):
+        walk_body(body)
+    return parent_map
+
+
+def _find_botyard_pmbase_to_palm_from_urdf(urdf_path):
+    """
+    Parse the fixed PALM joint in Botyard URDF:
+      parent link="pmbase", child link="palm", origin xyz/rpy
+    Return (xyz, rpy). Fallback to known constants if parse fails.
+    """
+    fallback_xyz = [-0.011315, 0.0, 0.01845]
+    fallback_rpy = [0.0, 0.0, -1.5708]
+    try:
+        tree = ET.parse(urdf_path)
+        root = tree.getroot()
+        for joint in root.findall("joint"):
+            if joint.get("name") != "PALM":
+                continue
+            parent = joint.find("parent")
+            child = joint.find("child")
+            origin = joint.find("origin")
+            if parent is None or child is None or origin is None:
+                continue
+            if parent.get("link") == "pmbase" and child.get("link") == "palm":
+                xyz = [float(x) for x in origin.get("xyz", "-0.011315 0 0.01845").split()]
+                rpy = [float(x) for x in origin.get("rpy", "0 0 -1.5708").split()]
+                return xyz, rpy
+    except Exception as e:
+        logging.warning(f"Failed to parse Botyard URDF PALM joint: {e}")
+    return fallback_xyz, fallback_rpy
+
+
+def _get_botyard_alignment_and_mapping():
+    """
+    Build all Botyard conversion meta in one place:
+    - source 16-DoF joint order (BODex cspace order by name)
+    - target 20-DoF MuJoCo order (from XML traversal + equality mimic)
+    - pmbase->palm transform from URDF PALM joint
+    """
+    if "meta" in _BOTYARD_CACHE:
+        return _BOTYARD_CACHE["meta"]
+
+    bodex_cfg = "/home/rw/Documents/BODex/src/curobo/content/configs/robot/right_botyard_hand_sim.yml"
+    botyard_urdf = "/home/rw/Documents/BODex/src/curobo/content/assets/robot/botyard_description/botyard_rh.urdf"
+    dgb_xml = "/home/rw/Documents/DexGraspBench/assets/hand/botyard/right_hand_noforearm.xml"
+
+    # Source 16-DoF order from BODex robot cspace.
+    source_joint_names = [
+        "FFJ4", "FFJ3", "FFJ2",
+        "MFJ4", "MFJ3", "MFJ2",
+        "RFJ4", "RFJ3", "RFJ2",
+        "LFJ4", "LFJ3", "LFJ2",
+        "THJ4", "THJ3", "THJ2", "THJ1",
+    ]
+    try:
+        import yaml
+
+        with open(bodex_cfg, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cspace_names = (
+            cfg.get("robot_cfg", {})
+            .get("kinematics", {})
+            .get("cspace", {})
+            .get("joint_names", None)
+        )
+        if isinstance(cspace_names, list) and len(cspace_names) == 16:
+            source_joint_names = [str(x) for x in cspace_names]
+    except Exception as e:
+        logging.warning(f"Fallback to default Botyard source joint order: {e}")
+
+    src_name_to_idx = {n: i for i, n in enumerate(source_joint_names)}
+
+    # Target 20-DoF order from MuJoCo XML joint tree (hand-only).
+    parent_map = _find_mujoco_joint_parent_map(dgb_xml)
+    canonical_target = [
+        "THJ4", "THJ3", "THJ2", "THJ1",
+        "FFJ4", "FFJ3", "FFJ2", "FFJ1",
+        "MFJ4", "MFJ3", "MFJ2", "MFJ1",
+        "RFJ4", "RFJ3", "RFJ2", "RFJ1",
+        "LFJ4", "LFJ3", "LFJ2", "LFJ1",
+    ]
+    if all(j in parent_map for j in canonical_target):
+        target_joint_names = canonical_target
+    else:
+        # If XML evolves, keep stable fallback.
+        target_joint_names = canonical_target
+
+    # Mimic rules from URDF / MuJoCo equality: *J1 follows *J2.
+    mimic_from = {
+        "FFJ1": "FFJ2",
+        "MFJ1": "MFJ2",
+        "RFJ1": "RFJ2",
+        "LFJ1": "LFJ2",
+    }
+
+    # pmbase->palm from URDF PALM fixed joint.
+    pmbase_to_palm_xyz, pmbase_to_palm_rpy = _find_botyard_pmbase_to_palm_from_urdf(botyard_urdf)
+
+    meta = {
+        "source_joint_names": source_joint_names,
+        "target_joint_names": target_joint_names,
+        "src_name_to_idx": src_name_to_idx,
+        "mimic_from": mimic_from,
+        "pmbase_to_palm_xyz": pmbase_to_palm_xyz,
+        "pmbase_to_palm_rpy": pmbase_to_palm_rpy,
+    }
+    _BOTYARD_CACHE["meta"] = meta
+    return meta
 
 
 def resolve_bodex_scene_cfg_path(scene_path_rel: str, data_file: str) -> str:
@@ -56,6 +200,26 @@ def BODex(params):
     raw_data = np.load(data_file, allow_pickle=True).item()
     robot_pose = raw_data["robot_pose"][0]
     new_data = {}
+
+    # For Botyard, reorder candidates by grasp quality before conversion.
+    if configs.hand_name == "botyard" and robot_pose.ndim >= 3 and robot_pose.shape[0] > 1:
+        score = np.zeros((robot_pose.shape[0],), dtype=np.float64)
+        has_quality = False
+        if "grasp_error" in raw_data:
+            ge = np.asarray(raw_data["grasp_error"])[0]
+            if ge.ndim >= 2 and ge.shape[0] == robot_pose.shape[0]:
+                score += np.linalg.norm(ge, axis=-1)
+                has_quality = True
+        if "dist_error" in raw_data:
+            de = np.asarray(raw_data["dist_error"])[0]
+            if de.ndim >= 2 and de.shape[0] == robot_pose.shape[0]:
+                score += np.linalg.norm(de, axis=-1)
+                has_quality = True
+        if not has_quality:
+            # Fallback: prefer smoother pregrasp->squeeze joint movement.
+            score = np.linalg.norm(robot_pose[:, 2, 7:] - robot_pose[:, 0, 7:], axis=-1)
+        order = np.argsort(score)
+        robot_pose = robot_pose[order]
 
     scene_path_raw = raw_data["scene_path"]
     if isinstance(scene_path_raw, (list, tuple, np.ndarray)):
@@ -107,6 +271,89 @@ def BODex(params):
         robot_pose[:, :, 3:7] = torch_matrix_to_quaternion(tmp_rot)
         robot_pose[:, :, :3] -= (tmp_rot @ torch.tensor([0, 0, 0.1])).numpy()
         pass
+    elif configs.hand_name == "botyard":
+        meta = _get_botyard_alignment_and_mapping()
+        target_joint_names = meta["target_joint_names"]
+        mimic_from = meta["mimic_from"]
+        src_name_to_idx = dict(meta["src_name_to_idx"])
+
+        # Prefer per-file joint order from BODex raw output when available.
+        # This is the most reliable source and avoids hard-coded assumptions.
+        raw_joint_names = raw_data.get("joint_names", None)
+        if isinstance(raw_joint_names, (list, tuple, np.ndarray)):
+            names = [str(x) for x in list(raw_joint_names)]
+            if len(names) == 16 and len(set(names)) == 16:
+                src_name_to_idx = {n: i for i, n in enumerate(names)}
+                logging.info(f"Use Botyard raw joint_names order: {names}")
+
+        # Expand BODex Botyard qpos (23 = 7 root + 16 hand joints) to MuJoCo
+        # botyard no-forearm xml qpos (27 = 7 root + 20 hand joints) by joint names.
+        if robot_pose.shape[-1] == 23:
+            root = robot_pose[..., :7]
+            src = robot_pose[..., 7:]
+            target_vals = []
+            for j in target_joint_names:
+                src_j = mimic_from.get(j, j)
+                if src_j not in src_name_to_idx:
+                    raise KeyError(f"Botyard joint mapping missing source joint: {src_j}")
+                target_vals.append(src[..., src_name_to_idx[src_j]])
+            joints20 = np.stack(target_vals, axis=-1)
+            robot_pose = np.concatenate([root, joints20], axis=-1)
+
+        # Root frame conversion:
+        # BODex root is palm (base_link="palm"), DGBench root is pmbase.
+        # Use URDF PALM joint (pmbase->palm), then compute:
+        #   R_new = R_old @ R(pmbase->palm)^T
+        #   p_new = p_old - R_new * t(pmbase->palm)
+        # Optional env overrides remain available for manual experiments.
+        auto_rpy = meta["pmbase_to_palm_rpy"]
+        auto_xyz = meta["pmbase_to_palm_xyz"]
+
+        rpy_bias_str = os.environ.get(
+            "BOTYARD_FIXED_RPY_BIAS",
+            f"{-auto_rpy[0]},{-auto_rpy[1]},{-auto_rpy[2]}",
+        ).strip()
+        try:
+            rpy_vals = _parse_csv_floats(rpy_bias_str, 3)
+            r_bias = torch.tensor(
+                te.euler2mat(*rpy_vals, axes="sxyz"), dtype=torch.float32
+            ).view(1, 1, 3, 3)
+            r_old = torch_quaternion_to_matrix(torch.tensor(robot_pose[:, :, 3:7]))
+            r_new = r_old @ r_bias
+            robot_pose[:, :, 3:7] = torch_matrix_to_quaternion(r_new).numpy()
+            logging.info(f"Apply BOTYARD_FIXED_RPY_BIAS={rpy_vals}")
+        except ValueError:
+            logging.warning(
+                f"Invalid BOTYARD_FIXED_RPY_BIAS={rpy_bias_str!r}, expected 'r,p,y'."
+            )
+            r_new = torch_quaternion_to_matrix(torch.tensor(robot_pose[:, :, 3:7]))
+
+        bias_vec_str = os.environ.get(
+            "BOTYARD_FIXED_BIAS_VEC",
+            f"{auto_xyz[0]},{auto_xyz[1]},{auto_xyz[2]}",
+        ).strip()
+        try:
+            vals = _parse_csv_floats(bias_vec_str, 3)
+            delta = (
+                r_new @ torch.tensor(vals, dtype=torch.float32).view(1, 1, 3, 1)
+            ).squeeze(-1).numpy()
+            # Follow shadow convention: root -= R * bias.
+            robot_pose[:, :, :3] -= delta
+            logging.info(f"Apply BOTYARD_FIXED_BIAS_VEC={vals}")
+            if os.environ.get("BOTYARD_PRINT_ALIGN_DIAG", "1").strip().lower() in {
+                "1", "true", "yes", "on"
+            }:
+                logging.info(
+                    "Botyard auto-alignment meta: "
+                    f"src16={meta['source_joint_names']}, "
+                    f"target20={meta['target_joint_names']}, "
+                    f"auto_pmbase_to_palm_xyz={auto_xyz}, "
+                    f"auto_pmbase_to_palm_rpy={auto_rpy}"
+                )
+        except ValueError:
+            logging.warning(
+                f"Invalid BOTYARD_FIXED_BIAS_VEC={bias_vec_str!r}, expected 'x,y,z'."
+            )
     else:
         raise NotImplementedError
 
