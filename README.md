@@ -78,6 +78,23 @@ To evaluate the synthesized grasps of [BODex](https://github.com/JYChen18/BODex)
 bash script/test_BODex_shadow.sh
 ```
 
+For a quick one-sample conversion + evaluation pipeline on **Botyard** (BODex raw outputs),
+```bash
+bash script/one_sample_BODex_botyard.sh
+```
+Useful optional env vars:
+```bash
+# evaluate one sampled object from BODex raw outputs (default behavior)
+FORMAT_MAX_NUM=1 EVAL_MAX_NUM=-1 bash script/one_sample_BODex_botyard.sh
+
+# random seed per run and enable viewer
+RANDOM_EACH_RUN=True DEBUG_VIEWER=True bash script/one_sample_BODex_botyard.sh
+
+# override raw input folder if needed
+BODEX_RAW_DIR=../BODex/src/curobo/content/assets/output/sim_botyard/fc/debug/grasp_data \
+bash script/one_sample_BODex_botyard.sh
+```
+
 To evaluate the synthesized grasps of [DexLearn](https://github.com/JYChen18/DexLearn),
 ```bash
 bash script/test_learning_shadow.sh
