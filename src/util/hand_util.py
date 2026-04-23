@@ -24,6 +24,7 @@ class MjHO:
         exclude_table_contact,
         friction_coef,
         has_floor_z0,
+        disable_gravity=True,
         debug_render=False,
         debug_viewer=False,
     ):
@@ -32,7 +33,8 @@ class MjHO:
         self.spec.meshdir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         self.spec.option.timestep = 0.004
         self.spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-        self.spec.option.disableflags = mujoco.mjtDisableBit.mjDSBL_GRAVITY
+        if disable_gravity:
+            self.spec.option.disableflags = mujoco.mjtDisableBit.mjDSBL_GRAVITY
         if debug_render or debug_viewer:
             self.spec.add_texture(
                 type=mujoco.mjtTexture.mjTEXTURE_SKYBOX,

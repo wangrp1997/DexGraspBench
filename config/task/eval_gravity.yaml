@@ -1,26 +1,26 @@
 max_num: -1
-obj_mass: 0.1   # unit: kg 
+obj_mass: 0.1   # unit: kg
 miu_coef: [0.6, 0.02]
 debug_render: False
 debug_viewer: False
 debug_dir: ${save_dir}/debug
-# Keep original behavior by default:
-# - disable gravity in MuJoCo
-# - apply equivalent downward external force on object
-disable_gravity: True
-use_external_gravity: True
 
-simulation_metrics: 
+# Real-gravity variant:
+# - enable gravity in MuJoCo
+# - do not inject equivalent external downward force
+disable_gravity: False
+use_external_gravity: False
+
+simulation_metrics:
   max_pene: 0.01  # If the initial hand penetrates the object too much, regard it as a failure
   trans_thre: 0.05
   angle_thre: 15
 
-analytic_fc_metrics: 
-  contact_tip_only: True 
+analytic_fc_metrics:
+  contact_tip_only: True
   contact_threshold: 0.005
   type: ['qp', 'qp_dfc', 'q1', 'tdg', 'dfc']
 
-pene_contact_metrics: 
+pene_contact_metrics:
   contact_margin: 0.01  # unit: m. Max contact distance.
   contact_threshold: 0.002
-

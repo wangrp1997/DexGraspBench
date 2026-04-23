@@ -55,12 +55,12 @@ python src/main.py \
   task.max_num="$FORMAT_MAX_NUM" \
   task.data_path="$SELECTED_OBJECT_DIR"
 
-# 2) Evaluate all converted grasps under this selected object.
+# 2) Evaluate all converted grasps under this selected object (real gravity mode).
 python src/main.py \
   seed="$SEED" \
   setting=tabletop \
   hand=ur10e_shadow \
-  task=eval \
+  task=eval_gravity \
   exp_name=debug_one \
   task.max_num="$EVAL_MAX_NUM" \
   task.debug_viewer="$DEBUG_VIEWER" \
@@ -91,7 +91,7 @@ if [ -n "$SAMPLED_SUCCESS_PATH" ]; then
     seed="$SEED" \
     setting=tabletop \
     hand=ur10e_shadow \
-    task=eval \
+    task=eval_gravity \
     exp_name=debug_one \
     grasp_dir="$OUT_DIR/succgrasp" \
     eval_dir="$OUT_DIR/evaluation_view_one" \

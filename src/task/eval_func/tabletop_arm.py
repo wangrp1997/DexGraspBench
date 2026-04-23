@@ -8,11 +8,12 @@ from .base import BaseEval
 
 class tabletopArmEval(BaseEval):
     def _simulate_under_extforce_details(self, pre_obj_qpos):
-        # 1. Set object gravity
-        external_force_direction = np.array([0.0, 0, -1, 0, 0, 0])
-        self.mj_ho.set_ext_force_on_obj(
-            10 * external_force_direction * self.configs.task.obj_mass
-        )
+        # 1. Set object gravity (legacy mode uses equivalent external force when gravity is disabled).
+        if getattr(self.configs.task, "use_external_gravity", True):
+            external_force_direction = np.array([0.0, 0, -1, 0, 0, 0])
+            self.mj_ho.set_ext_force_on_obj(
+                10 * external_force_direction * self.configs.task.obj_mass
+            )
 
         # 2. Approaching
         approach_length = self.grasp_data["approach_qpos"].shape[0]

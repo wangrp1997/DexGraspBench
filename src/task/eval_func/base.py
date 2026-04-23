@@ -41,6 +41,7 @@ class BaseEval:
             hand_mocap=configs.hand.mocap,
             exclude_table_contact=configs.hand.exclude_table_contact,
             friction_coef=configs.task.miu_coef,
+            disable_gravity=getattr(configs.task, "disable_gravity", True),
             debug_render=configs.task.debug_render,
             debug_viewer=configs.task.debug_viewer,
         )
