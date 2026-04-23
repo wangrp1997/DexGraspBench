@@ -5,3 +5,6 @@ __pycache__/
 output*
 assets/
 debug*
+.cursor/
+docs/
+third_party/filterpy/

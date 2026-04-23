@@ -10,6 +10,14 @@ debug_dir: ${save_dir}/debug
 # - do not inject equivalent external downward force
 disable_gravity: False
 use_external_gravity: False
+ekf_input_debug: True
+ekf_input_print_every: 20
+ekf_input_stage: post_lift   # all | post_lift
+ekf_input_post_lift_steps: -1   # -1 means keep printing while debug_viewer window is open
+ekf_smoke_enable: True
+ekf_smoke_print_every: 50
+ekf_contact_warn_ratio: 0.6   # warn when (new+lost)/max(1, prev+curr) exceeds this value
+ekf_step_every: 2   # run EKF callback every N sim steps (>=1)
 
 simulation_metrics:
   max_pene: 0.01  # If the initial hand penetrates the object too much, regard it as a failure

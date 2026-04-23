@@ -95,6 +95,7 @@ class MjHO:
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
             self.debug_images = []
+        self.step_callback = None
         return
 
     def _add_hand(self, xml_path, mocap_base):
@@ -292,6 +293,8 @@ class MjHO:
     def control_hand_step(self, step_inner):
         for _ in range(step_inner):
             mujoco.mj_step(self.model, self.data)
+            if self.step_callback is not None:
+                self.step_callback(self)
             if self.debug_viewer is not None:
                 self.debug_viewer.sync()
                 # Slow down to interactive speed so the viewer is observable.
