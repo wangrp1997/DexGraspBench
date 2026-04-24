@@ -24,5 +24,6 @@ from .runner import RunnerStepResult
 from .runner import run_one_step_smoke
 from .pose_metrics import EkfPoseMetricsTracker
 from .pose_metrics import quat_wxyz_to_rotvec
+from .pose_viz import plot_metrics
 from .state import InhandState
 

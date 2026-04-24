@@ -78,9 +78,11 @@ class EkfOnlineInputLogger:
         # u_t  : qvel (control)
         # z_t  : [q, tau_meas], tau_meas = qfrc_constraint
         # x_gt : object pose (only for evaluation, not fed to EKF update)
-        q_all = mj_ho.data.qpos[:-7]
-        qvel_all = mj_ho.data.qvel[:-6]
-        tau_all = mj_ho.data.qfrc_constraint[:-6]
+        # Use full vectors and select finger indices explicitly.
+        # This stays correct even if extra free joints (e.g., visualization overlays) are added.
+        q_all = mj_ho.data.qpos
+        qvel_all = mj_ho.data.qvel
+        tau_all = mj_ho.data.qfrc_constraint
         q = q_all[self._finger_qpos_idx]
         qvel = qvel_all[self._finger_dof_idx]
         tau_meas = tau_all[self._finger_dof_idx]

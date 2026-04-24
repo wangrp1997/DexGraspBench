@@ -44,6 +44,25 @@ class BaseEval:
             disable_gravity=getattr(configs.task, "disable_gravity", True),
             debug_render=configs.task.debug_render,
             debug_viewer=configs.task.debug_viewer,
+            pose_overlay_enable=bool(
+                getattr(configs.task, "ekf_pose_mesh_overlay_enable", False)
+            ),
+            pose_overlay_gt_rgba=np.asarray(
+                getattr(
+                    configs.task,
+                    "ekf_pose_mesh_overlay_gt_rgba",
+                    [0.0, 1.0, 0.0, 0.25],
+                ),
+                dtype=float,
+            ),
+            pose_overlay_est_rgba=np.asarray(
+                getattr(
+                    configs.task,
+                    "ekf_pose_mesh_overlay_est_rgba",
+                    [1.0, 0.0, 0.0, 0.25],
+                ),
+                dtype=float,
+            ),
         )
 
         if self.configs.task.debug_viewer or self.configs.task.debug_render:

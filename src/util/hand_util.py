@@ -27,6 +27,9 @@ class MjHO:
         disable_gravity=True,
         debug_render=False,
         debug_viewer=False,
+        pose_overlay_enable=False,
+        pose_overlay_gt_rgba=None,
+        pose_overlay_est_rgba=None,
     ):
         self.hand_mocap = hand_mocap
         self.spec = mujoco.MjSpec()
@@ -53,6 +56,17 @@ class MjHO:
                 name="closeup", pos=[0.75, 1.0, 1.0], xyaxes=[-1, 0, 0, 0, -1, 1]
             )
 
+        self.pose_overlay_enable = bool(pose_overlay_enable)
+        self.pose_overlay_gt_rgba = (
+            np.asarray(pose_overlay_gt_rgba, dtype=float)
+            if pose_overlay_gt_rgba is not None
+            else np.array([0.0, 1.0, 0.0, 0.25], dtype=float)
+        )
+        self.pose_overlay_est_rgba = (
+            np.asarray(pose_overlay_est_rgba, dtype=float)
+            if pose_overlay_est_rgba is not None
+            else np.array([1.0, 0.0, 0.0, 0.25], dtype=float)
+        )
         self._add_hand(hand_xml_path, hand_mocap)
         self._add_object(obj_path, obj_scale, obj_density, has_floor_z0)
         self._set_friction(friction_coef)
@@ -66,7 +80,18 @@ class MjHO:
         # Get ready for simulation
         self.model = self.spec.compile()
         self.data = mujoco.MjData(self.model)
-
+        self._obj_body_id = int(self.model.body("object").id)
+        self._obj_joint_qpos_adr = int(self.model.joint("obj_freejoint").qposadr[0])
+        self._obj_joint_dof_adr = int(self.model.joint("obj_freejoint").dofadr[0])
+        self._obj_est_joint_qpos_adr = None
+        self._obj_est_joint_dof_adr = None
+        if self.pose_overlay_enable:
+            self._obj_est_joint_qpos_adr = int(
+                self.model.joint("obj_est_freejoint").qposadr[0]
+            )
+            self._obj_est_joint_dof_adr = int(
+                self.model.joint("obj_est_freejoint").dofadr[0]
+            )
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         mujoco.mj_forward(self.model, self.data)
 
@@ -79,7 +104,10 @@ class MjHO:
             self.data.moment_rowadr,
             self.data.moment_colind,
         )
-        self._qpos2ctrl_matrix = qpos2ctrl_matrix[..., :-6]
+        # Keep only hand DOFs (everything before obj_freejoint).
+        # This is robust when extra freejoints (e.g., object_est) are added.
+        hand_dof = self._obj_joint_dof_adr
+        self._qpos2ctrl_matrix = qpos2ctrl_matrix[:, :hand_dof]
 
         self.debug_viewer = None
         self.debug_render = None
@@ -141,6 +169,24 @@ class MjHO:
 
         obj_body = self.spec.worldbody.add_body(name="object")
         obj_body.add_freejoint(name="obj_freejoint")
+        obj_est_body = None
+        if self.pose_overlay_enable:
+            obj_est_body = self.spec.worldbody.add_body(name="object_est")
+            obj_est_body.add_freejoint(name="obj_est_freejoint")
+            # Make overlay body gravity-compensated when supported by API.
+            if hasattr(obj_est_body, "gravcomp"):
+                obj_est_body.gravcomp = 1.0
+            # Keep a tiny non-colliding support geom so object_est has non-zero mass.
+            obj_est_body.add_geom(
+                name="object_est_mass_stub",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[0.01, 0.01, 0.01],
+                pos=[0.0, 0.0, 0.0],
+                density=1000.0,
+                contype=0,
+                conaffinity=0,
+                rgba=[0.0, 0.0, 0.0, 0.0],
+            )
         parts_folder = os.path.join(obj_path, "urdf/meshes")
         for file in os.listdir(parts_folder):
             file_path = os.path.join(parts_folder, file)
@@ -159,6 +205,7 @@ class MjHO:
                 density=0,
                 contype=0,
                 conaffinity=0,
+                rgba=self.pose_overlay_gt_rgba,
             )
             obj_body.add_geom(
                 name=f"object_collision_{mesh_id}",
@@ -166,6 +213,16 @@ class MjHO:
                 meshname=mesh_name,
                 density=obj_density,
             )
+            if self.pose_overlay_enable and obj_est_body is not None:
+                obj_est_body.add_geom(
+                    name=f"object_est_visual_{mesh_id}",
+                    type=mujoco.mjtGeom.mjGEOM_MESH,
+                    meshname=mesh_name,
+                    density=0,
+                    contype=0,
+                    conaffinity=0,
+                    rgba=self.pose_overlay_est_rgba,
+                )
 
         return
 
@@ -185,7 +242,26 @@ class MjHO:
             return self._qpos2ctrl_matrix @ hand_qpos
 
     def get_obj_pose(self):
-        return self.data.qpos[-7:]
+        s = self._obj_joint_qpos_adr
+        return self.data.qpos[s : s + 7].copy()
+
+    def set_est_obj_pose(self, obj_pose):
+        if (not self.pose_overlay_enable) or (self._obj_est_joint_qpos_adr is None):
+            return
+        obj_pose = np.asarray(obj_pose, dtype=float).reshape(-1)
+        if obj_pose.shape[0] != 7:
+            raise ValueError(f"obj_pose must have shape (7,), got {obj_pose.shape}")
+        s = self._obj_est_joint_qpos_adr
+        self.data.qpos[s : s + 7] = obj_pose
+        self._freeze_est_obj_dynamics()
+        mujoco.mj_forward(self.model, self.data)
+
+    def _freeze_est_obj_dynamics(self):
+        if (not self.pose_overlay_enable) or (self._obj_est_joint_dof_adr is None):
+            pass
+        else:
+            v = self._obj_est_joint_dof_adr
+            self.data.qvel[v : v + 6] = 0.0
 
     def get_contact_info(self, hand_qpos, obj_pose, obj_margin=0):
         # Set margin and gap to detect contact
@@ -196,9 +272,7 @@ class MjHO:
         # Set pose and qpos for hand and object
         self.reset_pose_qpos(hand_qpos, obj_pose)
 
-        object_id = self.model.nbody - 1
-        hand_id = self.model.nbody - 2
-        world_id = -1 if self.hand_mocap else 0
+        object_id = self._obj_body_id
 
         # Processing all contact information
         ho_contact = []
@@ -208,10 +282,16 @@ class MjHO:
             body2_id = self.model.geom(contact.geom2).bodyid
             body1_name = self.model.body(self.model.geom(contact.geom1).bodyid).name
             body2_name = self.model.body(self.model.geom(contact.geom2).bodyid).name
+            body1_is_hand = isinstance(body1_name, str) and body1_name.startswith(
+                self.hand_prefix
+            )
+            body2_is_hand = isinstance(body2_name, str) and body2_name.startswith(
+                self.hand_prefix
+            )
             # hand and object
-            if (
-                body1_id > world_id and body1_id < hand_id and body2_id == object_id
-            ) or (body2_id > world_id and body2_id < hand_id and body1_id == object_id):
+            if (body1_is_hand and body2_id == object_id) or (
+                body2_is_hand and body1_id == object_id
+            ):
                 # keep body1=hand and body2=object
                 if body2_id == object_id:
                     contact_normal = contact.frame[0:3]
@@ -231,12 +311,7 @@ class MjHO:
                     }
                 )
             # hand and hand
-            elif (
-                body1_id > world_id
-                and body1_id < hand_id
-                and body2_id > world_id
-                and body2_id < hand_id
-            ):
+            elif body1_is_hand and body2_is_hand:
                 hh_contact.append(
                     {
                         "contact_dist": contact.dist,
@@ -256,12 +331,22 @@ class MjHO:
         return ho_contact, hh_contact
 
     def set_ext_force_on_obj(self, ext_force):
-        self.data.xfrc_applied[-1] = ext_force
+        self.data.xfrc_applied[self._obj_body_id] = ext_force
         return
 
     def reset_pose_qpos(self, hand_qpos, obj_pose):
         # set key frame
-        self.model.key_qpos[0] = np.concatenate([hand_qpos, obj_pose], axis=0)
+        self.model.key_qpos[0] = 0.0
+        hand_qpos = np.asarray(hand_qpos, dtype=float).reshape(-1)
+        obj_pose = np.asarray(obj_pose, dtype=float).reshape(-1)
+        self.model.key_qpos[0, : hand_qpos.shape[0]] = hand_qpos
+        self.model.key_qpos[
+            0, self._obj_joint_qpos_adr : self._obj_joint_qpos_adr + 7
+        ] = obj_pose
+        if self.pose_overlay_enable and self._obj_est_joint_qpos_adr is not None:
+            self.model.key_qpos[
+                0, self._obj_est_joint_qpos_adr : self._obj_est_joint_qpos_adr + 7
+            ] = obj_pose
         self.model.key_ctrl[0] = self._qpos2ctrl(hand_qpos)
         self.model.key_qvel[0] = 0
         self.model.key_act[0] = 0
@@ -270,6 +355,8 @@ class MjHO:
             self.model.key_mquat[0] = hand_qpos[3:7]
 
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        if self.pose_overlay_enable:
+            self.set_est_obj_pose(obj_pose)
         mujoco.mj_forward(self.model, self.data)
         return
 
@@ -292,7 +379,9 @@ class MjHO:
 
     def control_hand_step(self, step_inner):
         for _ in range(step_inner):
+            self._freeze_est_obj_dynamics()
             mujoco.mj_step(self.model, self.data)
+            self._freeze_est_obj_dynamics()
             if self.step_callback is not None:
                 self.step_callback(self)
             if self.debug_viewer is not None:
@@ -317,7 +406,9 @@ class MjHO:
         # appear frozen once the scripted trajectory (through lift) finishes.
         while self.debug_viewer.is_running():
             with self.debug_viewer.lock():
+                self._freeze_est_obj_dynamics()
                 mujoco.mj_step(self.model, self.data)
+                self._freeze_est_obj_dynamics()
             self.debug_viewer.sync()
             time.sleep(0.01)
         return

@@ -1,5 +1,8 @@
+import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+from .pose_viz import EkfPoseViz
 
 
 def _wxyz_to_xyzw(q_wxyz: np.ndarray) -> np.ndarray:
@@ -35,12 +38,36 @@ class EkfPoseMetricsTracker:
     COLOR_VAL = "\033[92m"
     COLOR_RESET = "\033[0m"
 
-    def __init__(self, print_every: int = 50):
+    def __init__(
+        self,
+        print_every: int = 50,
+        output_dir: str | None = None,
+        realtime_plot: bool = False,
+    ):
         self.print_every = max(1, int(print_every))
-        self.pos_errors = []
-        self.rot_errors_deg = []
+        self.output_dir = output_dir or os.path.abspath("output/debug_one_ur10e_shadow")
+        self.viz = EkfPoseViz(
+            output_dir=self.output_dir,
+            realtime_enable=realtime_plot,
+        )
+        self._logs = {
+            "step": [],
+            "n_contacts": [],
+            "pos_err": [],
+            "rot_err_deg": [],
+            "u_norm": [],
+            "innov_norm": [],
+        }
 
-    def update(self, step: int, x_est6: np.ndarray, x_gt7: np.ndarray, n_contacts: int) -> None:
+    def update(
+        self,
+        step: int,
+        x_est6: np.ndarray,
+        x_gt7: np.ndarray,
+        n_contacts: int,
+        u_norm: float = float("nan"),
+        innov_norm: float = float("nan"),
+    ) -> None:
         x_est6 = np.asarray(x_est6, dtype=float).reshape(-1)
         x_gt7 = np.asarray(x_gt7, dtype=float).reshape(-1)
         if x_est6.shape[0] < 6 or x_gt7.shape[0] < 7:
@@ -49,8 +76,18 @@ class EkfPoseMetricsTracker:
         # MuJoCo free joint qpos convention: [x, y, z, qw, qx, qy, qz]
         q_gt = np.array([x_gt7[3], x_gt7[4], x_gt7[5], x_gt7[6]], dtype=float)
         rot_err = _rot_err_deg(x_est6[3:6], q_gt)
-        self.pos_errors.append(pos_err)
-        self.rot_errors_deg.append(rot_err)
+        self._logs["step"].append(int(step))
+        self._logs["n_contacts"].append(int(n_contacts))
+        self._logs["pos_err"].append(pos_err)
+        self._logs["rot_err_deg"].append(rot_err)
+        self._logs["u_norm"].append(float(u_norm))
+        self._logs["innov_norm"].append(float(innov_norm))
+        self.viz.update_realtime(
+            steps=self._logs["step"],
+            pos_err=self._logs["pos_err"],
+            rot_err=self._logs["rot_err_deg"],
+            u_norm=self._logs["u_norm"],
+        )
         if step % self.print_every == 0:
             print(
                 f"{self.COLOR_TAG}[EKF-METRIC]{self.COLOR_RESET} "
@@ -61,10 +98,10 @@ class EkfPoseMetricsTracker:
             )
 
     def emit_summary(self) -> None:
-        if len(self.pos_errors) == 0:
+        if len(self._logs["pos_err"]) == 0:
             return
-        pos_arr = np.asarray(self.pos_errors, dtype=float)
-        rot_arr = np.asarray(self.rot_errors_deg, dtype=float)
+        pos_arr = np.asarray(self._logs["pos_err"], dtype=float)
+        rot_arr = np.asarray(self._logs["rot_err_deg"], dtype=float)
         print(
             f"{self.COLOR_TAG}[EKF-METRIC-SUM]{self.COLOR_RESET} "
             f"{self.COLOR_KEY}N={self.COLOR_RESET}{self.COLOR_VAL}{pos_arr.size}{self.COLOR_RESET} "
@@ -74,4 +111,9 @@ class EkfPoseMetricsTracker:
             f"{self.COLOR_KEY}rot_mean={self.COLOR_RESET}{self.COLOR_VAL}{np.mean(rot_arr):.3f}{self.COLOR_RESET} "
             f"{self.COLOR_KEY}rot_p90={self.COLOR_RESET}{self.COLOR_VAL}{np.percentile(rot_arr, 90):.3f}{self.COLOR_RESET} "
             f"{self.COLOR_KEY}rot_max={self.COLOR_RESET}{self.COLOR_VAL}{np.max(rot_arr):.3f}{self.COLOR_RESET}"
+        )
+        save_path = self.viz.save_outputs(self._logs, tag="ekf_pose_metrics")
+        print(
+            f"{self.COLOR_TAG}[EKF-METRIC-SAVE]{self.COLOR_RESET} "
+            f"{self.COLOR_KEY}path={self.COLOR_RESET}{self.COLOR_VAL}{save_path}{self.COLOR_RESET}"
         )

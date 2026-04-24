@@ -2,6 +2,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from .base import BaseEval
 from ekf_inhand.contact_manager import build_hq_inputs_with_contact_matching
@@ -20,6 +21,18 @@ from ekf_inhand.state import InhandState
 
 
 class tabletopArmEval(BaseEval):
+    @staticmethod
+    def _x6_to_pose7(x_est6: np.ndarray) -> np.ndarray:
+        x_est6 = np.asarray(x_est6, dtype=float).reshape(-1)
+        if x_est6.shape[0] != 6:
+            raise ValueError(f"x_est6 must have shape (6,), got {x_est6.shape}")
+        quat_xyzw = R.from_rotvec(x_est6[3:6]).as_quat()
+        # MuJoCo free joint uses [x, y, z, qw, qx, qy, qz].
+        quat_wxyz = np.array(
+            [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=float
+        )
+        return np.concatenate([x_est6[:3], quat_wxyz], axis=0)
+
     @staticmethod
     def _build_R_block_diag(m: int, r_q: float, r_tau: float) -> np.ndarray:
         R = np.zeros((2 * m, 2 * m), dtype=float)
@@ -96,10 +109,21 @@ class tabletopArmEval(BaseEval):
             "contact_stats": None,
             "no_contact_streak": 0,
             "pose_metrics": None,
+            "init_logged": False,
+            "pre_obj_qpos": np.asarray(pre_obj_qpos, dtype=float).reshape(-1).copy(),
         }
         if getattr(self.configs.task, "ekf_pose_eval_enable", True):
+            pose_output_dir = str(
+                getattr(
+                    self.configs.task,
+                    "ekf_pose_eval_output_dir",
+                    os.path.abspath("output/debug_one_ur10e_shadow"),
+                )
+            )
             ekf_ctx["pose_metrics"] = EkfPoseMetricsTracker(
-                print_every=int(getattr(self.configs.task, "ekf_pose_eval_print_every", 50))
+                print_every=int(getattr(self.configs.task, "ekf_pose_eval_print_every", 50)),
+                output_dir=pose_output_dir,
+                realtime_plot=bool(getattr(self.configs.task, "ekf_pose_eval_realtime_plot", False)),
             )
         if getattr(self.configs.task, "ekf_input_debug", False):
             ekf_logger = EkfOnlineInputLogger(
@@ -197,12 +221,55 @@ class tabletopArmEval(BaseEval):
         u_t = qvel
 
         if not ekf_ctx["inited"]:
-            # Minimal x0 hint: object position + zero orientation components.
+            # x0 hint for object pose block.
             x0_hint = np.zeros((6,), dtype=float)
-            x0_hint[:3] = np.asarray(x_gt[:3], dtype=float)
-            # MuJoCo free joint pose = [x, y, z, qw, qx, qy, qz].
-            # Initialize orientation from GT to avoid constant bias in absolute-pose metrics.
-            x0_hint[3:6] = quat_wxyz_to_rotvec(np.asarray(x_gt[3:7], dtype=float))
+            init_mode = str(getattr(self.configs.task, "ekf_init_mode", "gt_perturbed"))
+            if init_mode in ("gt_exact", "gt_perturbed"):
+                x0_hint[:3] = np.asarray(x_gt[:3], dtype=float)
+                x0_hint[3:6] = quat_wxyz_to_rotvec(np.asarray(x_gt[3:7], dtype=float))
+                if init_mode == "gt_perturbed":
+                    seed = int(getattr(self.configs.task, "ekf_init_seed", 0))
+                    sigma_pos = float(
+                        getattr(self.configs.task, "ekf_init_gt_pos_sigma", 0.01)
+                    )
+                    sigma_rot_deg = float(
+                        getattr(self.configs.task, "ekf_init_gt_rot_sigma_deg", 5.0)
+                    )
+                    rng = np.random.default_rng(seed)
+                    x0_hint[:3] = x0_hint[:3] + rng.normal(0.0, sigma_pos, size=3)
+                    rot_noise = rng.normal(0.0, np.deg2rad(sigma_rot_deg), size=3)
+                    x0_hint[3:6] = x0_hint[3:6] + rot_noise
+            elif init_mode == "nominal":
+                pre_obj_qpos = np.asarray(ekf_ctx["pre_obj_qpos"], dtype=float).reshape(-1)
+                if pre_obj_qpos.shape[0] < 7:
+                    raise ValueError(
+                        f"pre_obj_qpos must have at least 7 dims, got {pre_obj_qpos.shape}"
+                    )
+                x0_hint[:3] = pre_obj_qpos[:3]
+                x0_hint[3:6] = quat_wxyz_to_rotvec(pre_obj_qpos[3:7])
+                sigma_pos = float(
+                    getattr(self.configs.task, "ekf_init_nominal_pos_sigma", 0.02)
+                )
+                sigma_rot_deg = float(
+                    getattr(self.configs.task, "ekf_init_nominal_rot_sigma_deg", 10.0)
+                )
+                seed = int(getattr(self.configs.task, "ekf_init_seed", 0))
+                rng = np.random.default_rng(seed)
+                x0_hint[:3] = x0_hint[:3] + rng.normal(0.0, sigma_pos, size=3)
+                rot_noise = rng.normal(0.0, np.deg2rad(sigma_rot_deg), size=3)
+                x0_hint[3:6] = x0_hint[3:6] + rot_noise
+            else:
+                raise ValueError(
+                    f"Unsupported ekf_init_mode={init_mode}, expected gt_exact / gt_perturbed / nominal"
+                )
+            if not ekf_ctx["init_logged"]:
+                print(
+                    f"\033[95m[EKF-INIT]\033[0m "
+                    f"\033[94mmode=\033[0m\033[92m{init_mode}\033[0m "
+                    f"\033[94mx0_pos=\033[0m\033[92m{x0_hint[:3]}\033[0m "
+                    f"\033[94mx0_rotvec=\033[0m\033[92m{x0_hint[3:6]}\033[0m"
+                )
+                ekf_ctx["init_logged"] = True
             init_cfg = EkfInitConfig(init_contacts=0, x0_std=0.0, seed=0)
             state0 = build_initial_state(x0_hint=x0_hint, cfg=init_cfg)
             P0 = build_initial_covariance(state0=state0, cfg=init_cfg)
@@ -341,13 +408,19 @@ class tabletopArmEval(BaseEval):
 
         ekf_ctx["state"] = InhandState.unpack(step_res.ekf_update.y_next)
         ekf_ctx["P"] = step_res.ekf_update.P_next
+        est_pose7 = self._x6_to_pose7(ekf_ctx["state"].x)
+        if bool(getattr(self.configs.task, "ekf_pose_mesh_overlay_enable", False)):
+            mj_ho.set_est_obj_pose(est_pose7)
         pose_metrics = ekf_ctx.get("pose_metrics")
         if pose_metrics is not None:
+            innov_norm = float(np.linalg.norm(step_res.ekf_update.innovation))
             pose_metrics.update(
                 step=ekf_ctx["step"],
                 x_est6=ekf_ctx["state"].x,
                 x_gt7=x_gt,
                 n_contacts=ekf_ctx["state"].n_contacts,
+                u_norm=float(np.linalg.norm(u_t)),
+                innov_norm=innov_norm,
             )
         g_sanity_enable = bool(getattr(self.configs.task, "ekf_g_sanity_enable", False))
 
@@ -360,6 +433,7 @@ class tabletopArmEval(BaseEval):
             color_warn = "\033[91m"
             color_reset = "\033[0m"
             innov_norm = float(np.linalg.norm(step_res.ekf_update.innovation))
+            u_norm = float(np.linalg.norm(u_t))
             contact_stats = ekf_ctx.get("contact_stats")
             contact_stat_txt = ""
             g_sanity_txt = ""
@@ -413,6 +487,7 @@ class tabletopArmEval(BaseEval):
                 f"{color_key}n_contacts={color_reset}{color_val}{state_work.n_contacts}{color_reset} "
                 f"{color_key}dim_x_expected={color_reset}{color_val}{6 + 3 * state_work.n_contacts}{color_reset} "
                 f"{color_key}dim_x={color_reset}{color_val}{step_res.ekf_update.y_next.shape[0]}{color_reset} "
+                f"{color_key}|u|={color_reset}{color_val}{u_norm:.6f}{color_reset} "
                 f"{color_key}|innov|={color_reset}{color_val}{innov_norm:.6f}{color_reset}"
                 f"{contact_stat_txt}"
                 f"{g_sanity_txt}"

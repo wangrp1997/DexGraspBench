@@ -31,9 +31,19 @@ ekf_no_contact_tau_R_scale: 500.0   # multiply R_tau block when in prolonged no-
 ekf_audit_enable: True   # run Eq.(24)(25) index-consistency audit for y/P/Q/contact mapping
 ekf_audit_every: 20   # audit every N EKF callback steps
 ekf_g_sanity_enable: True   # print Eq.(6) G/J_motion sanity metrics in [EKF-SMOKE]
+ekf_init_mode: gt_perturbed   # gt_exact | gt_perturbed | nominal
+ekf_init_seed: 0
+ekf_init_gt_pos_sigma: 0.015   # meters, std for GT-perturbed init position
+ekf_init_gt_rot_sigma_deg: 4.0  # degrees, std for GT-perturbed init orientation (rotvec)
+ekf_init_nominal_pos_sigma: 0.03   # meters, std around pre_obj_qpos position
+ekf_init_nominal_rot_sigma_deg: 12.0  # degrees, std around pre_obj_qpos orientation
 ekf_pose_eval_enable: True   # print EKF pose-estimation error against MuJoCo GT
 ekf_pose_eval_print_every: 50  # [EKF-METRIC] print period
-
+ekf_pose_eval_realtime_plot: True  # True to show realtime error curves (matplotlib)
+ekf_pose_eval_output_dir: /home/rw/Documents/DexGraspBench/output/debug_one_ur10e_shadow  # always save .npz/.png metrics here
+ekf_pose_mesh_overlay_enable: True  # overlay estimated object mesh in viewer
+ekf_pose_mesh_overlay_gt_rgba: [0.0, 1.0, 0.0, 0.25]  # original object: transparent green
+ekf_pose_mesh_overlay_est_rgba: [1.0, 0.0, 0.0, 0.25]  # estimated object: transparent red
 simulation_metrics:
   max_pene: 0.01  # If the initial hand penetrates the object too much, regard it as a failure
   trans_thre: 0.05
