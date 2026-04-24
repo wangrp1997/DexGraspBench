@@ -5,302 +5,83 @@ import numpy as np
 
 from .base import BaseEval
 from ekf_inhand.contact_manager import build_hq_inputs_with_contact_matching
+from ekf_inhand.contact_manager import audit_state_cov_contact_alignment
 from ekf_inhand.contact_manager import expand_state_cov_for_new_contacts
 from ekf_inhand.contact_manager import shrink_state_cov_for_lost_contacts
 from ekf_inhand.input_stream import EkfOnlineInputLogger
 from ekf_inhand.init import EkfInitConfig
 from ekf_inhand.init import build_initial_covariance
 from ekf_inhand.init import build_initial_state
+from ekf_inhand.mj_geometry_adapter import MjEkfGeometryAdapter
+from ekf_inhand.pose_metrics import EkfPoseMetricsTracker
+from ekf_inhand.pose_metrics import quat_wxyz_to_rotvec
 from ekf_inhand.runner import run_one_step_smoke
 from ekf_inhand.state import InhandState
 
 
 class tabletopArmEval(BaseEval):
-    def _ensure_object_surface_cache(self, mj_ho):
-        if hasattr(self, "_ekf_obj_mesh_local") and self._ekf_obj_mesh_local is not None:
-            return
-
-        # Reuse hand_util.py-style mesh extraction from compiled MuJoCo model.
-        model = mj_ho.model
-        verts_all = []
-        faces_all = []
-        v_offset = 0
-        for gid in range(model.ngeom):
-            g = model.geom(gid)
-            gname = g.name
-            if not isinstance(gname, str) or "object_collision_" not in gname:
-                continue
-            if int(g.dataid) < 0:
-                continue
-            mesh = model.mesh(int(g.dataid))
-            v = np.asarray(
-                model.mesh_vert[mesh.vertadr[0] : mesh.vertadr[0] + mesh.vertnum[0]],
-                dtype=float,
-            )
-            f = np.asarray(
-                model.mesh_face[mesh.faceadr[0] : mesh.faceadr[0] + mesh.facenum[0]],
-                dtype=np.int32,
-            )
-            # mesh local -> geom local -> body(object) local
-            gpos = np.asarray(model.geom_pos[gid], dtype=float)
-            gquat = np.asarray(model.geom_quat[gid], dtype=float)
-            rot9 = np.zeros((9,), dtype=float)
-            import mujoco  # type: ignore[import-not-found]
-
-            mujoco.mju_quat2Mat(rot9, gquat)
-            grot = rot9.reshape(3, 3)
-            v_body = (grot @ v.T).T + gpos
-            verts_all.append(v_body)
-            faces_all.append(f + v_offset)
-            v_offset += v_body.shape[0]
-
-        if len(verts_all) == 0:
-            self._ekf_obj_mesh_local = None
-            return
-        verts = np.concatenate(verts_all, axis=0)
-        faces = np.concatenate(faces_all, axis=0)
-        import trimesh  # type: ignore[import-not-found]
-
-        self._ekf_obj_mesh_local = trimesh.Trimesh(
-            vertices=verts, faces=faces, process=False
-        )
+    @staticmethod
+    def _build_R_block_diag(m: int, r_q: float, r_tau: float) -> np.ndarray:
+        R = np.zeros((2 * m, 2 * m), dtype=float)
+        R[:m, :m] = np.eye(m, dtype=float) * float(r_q)
+        R[m:, m:] = np.eye(m, dtype=float) * float(r_tau)
+        return R
 
     @staticmethod
-    def _closest_point_on_triangle(p, a, b, c):
-        # Real-Time Collision Detection closest point routine.
-        ab = b - a
-        ac = c - a
-        ap = p - a
-        d1 = np.dot(ab, ap)
-        d2 = np.dot(ac, ap)
-        if d1 <= 0.0 and d2 <= 0.0:
-            return a
-        bp = p - b
-        d3 = np.dot(ab, bp)
-        d4 = np.dot(ac, bp)
-        if d3 >= 0.0 and d4 <= d3:
-            return b
-        vc = d1 * d4 - d3 * d2
-        if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-            v = d1 / (d1 - d3)
-            return a + v * ab
-        cp = p - c
-        d5 = np.dot(ab, cp)
-        d6 = np.dot(ac, cp)
-        if d6 >= 0.0 and d5 <= d6:
-            return c
-        vb = d5 * d2 - d1 * d6
-        if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-            w = d2 / (d2 - d6)
-            return a + w * ac
-        va = d3 * d6 - d5 * d4
-        if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-            w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
-            return b + w * (c - b)
-        denom = 1.0 / (va + vb + vc)
-        v = vb * denom
-        w = vc * denom
-        return a + ab * v + ac * w
+    def _build_Q_block_diag(state: InhandState, q_x: float, q_xi: float, q_f: float) -> np.ndarray:
+        dim = state.dim
+        Q = np.zeros((dim, dim), dtype=float)
+        Q[:6, :6] = np.eye(6, dtype=float) * float(q_x)
+        n = state.n_contacts
+        if n > 0:
+            xi_start = 6
+            xi_end = 6 + 2 * n
+            f_start = xi_end
+            f_end = f_start + n
+            Q[xi_start:xi_end, xi_start:xi_end] = np.eye(2 * n, dtype=float) * float(q_xi)
+            Q[f_start:f_end, f_start:f_end] = np.eye(n, dtype=float) * float(q_f)
+        return Q
 
-    @staticmethod
-    def _barycentric_uv(p, a, b, c):
-        v0 = b - a
-        v1 = c - a
-        v2 = p - a
-        d00 = float(np.dot(v0, v0))
-        d01 = float(np.dot(v0, v1))
-        d11 = float(np.dot(v1, v1))
-        d20 = float(np.dot(v2, v0))
-        d21 = float(np.dot(v2, v1))
-        denom = d00 * d11 - d01 * d01
-        if abs(denom) < 1e-12:
-            return np.array([0.0, 0.0], dtype=float)
-        v = (d11 * d20 - d01 * d21) / denom
-        w = (d00 * d21 - d01 * d20) / denom
-        # store (v,w); u can be recovered as 1-v-w
-        return np.array([v, w], dtype=float)
-
-    def _ensure_hand_surface_cache(self, mj_ho):
-        if hasattr(self, "_ekf_hand_mesh_by_body") and self._ekf_hand_mesh_by_body is not None:
-            return
-        self._ekf_hand_mesh_by_body = {}
-        model = mj_ho.model
-        for gid in range(model.ngeom):
-            g = model.geom(gid)
-            gname = g.name
-            if not isinstance(gname, str) or "hand:rh_" not in gname:
-                continue
-            if int(g.dataid) < 0:
-                continue
-            body_id = int(g.bodyid)
-            mesh = model.mesh(int(g.dataid))
-            v = np.asarray(
-                model.mesh_vert[mesh.vertadr[0] : mesh.vertadr[0] + mesh.vertnum[0]],
-                dtype=float,
-            )
-            f = np.asarray(
-                model.mesh_face[mesh.faceadr[0] : mesh.faceadr[0] + mesh.facenum[0]],
-                dtype=np.int32,
-            )
-            gpos = np.asarray(model.geom_pos[gid], dtype=float)
-            gquat = np.asarray(model.geom_quat[gid], dtype=float)
-            rot9 = np.zeros((9,), dtype=float)
-            import mujoco  # type: ignore[import-not-found]
-
-            mujoco.mju_quat2Mat(rot9, gquat)
-            grot = rot9.reshape(3, 3)
-            v_body = (grot @ v.T).T + gpos
-            if body_id not in self._ekf_hand_mesh_by_body:
-                self._ekf_hand_mesh_by_body[body_id] = {"verts": [], "faces": [], "offset": 0}
-            rec = self._ekf_hand_mesh_by_body[body_id]
-            rec["verts"].append(v_body)
-            rec["faces"].append(f + int(rec["offset"]))
-            rec["offset"] = int(rec["offset"]) + v_body.shape[0]
-        import trimesh  # type: ignore[import-not-found]
-
-        for body_id, rec in list(self._ekf_hand_mesh_by_body.items()):
-            vv = np.concatenate(rec["verts"], axis=0)
-            ff = np.concatenate(rec["faces"], axis=0)
-            mesh = trimesh.Trimesh(vertices=vv, faces=ff, process=False)
-            self._ekf_hand_mesh_by_body[body_id] = {
-                "mesh": mesh,
-                "face_normals": np.asarray(mesh.face_normals, dtype=float),
-            }
-
-    def _map_contact_to_object_xi(self, obj_body_id, c_world):
-        self._ensure_object_surface_cache(self.mj_ho)
-        mesh = getattr(self, "_ekf_obj_mesh_local", None)
-        if mesh is None:
-            return np.zeros((2,), dtype=float), -1
-        data = self.mj_ho.data
-        obj_pos = np.asarray(data.xpos[obj_body_id], dtype=float)
-        obj_rot = np.asarray(data.xmat[obj_body_id], dtype=float).reshape(3, 3)
-        p_local = obj_rot.T @ (np.asarray(c_world, dtype=float) - obj_pos)
-        verts = np.asarray(mesh.vertices, dtype=float)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-        best_d2 = float("inf")
-        best_face = 0
-        best_q = p_local
-        hint_dist2 = float("inf")
-        if faces.shape[0] > 0 and hasattr(self, "_ekf_face_hint_obj"):
-            pass
-        hint_face_id = -1
-        # backward-compatible call path may not pass hint; detect from frame locals
-        # when called through mapper interface below, hint is provided by wrapper.
-        # keep default full search.
-        if hasattr(self, "_ekf_obj_hint_face_runtime"):
-            hint_face_id = int(self._ekf_obj_hint_face_runtime)
-            self._ekf_obj_hint_face_runtime = -1
-        if 0 <= hint_face_id < faces.shape[0]:
-            tri = faces[hint_face_id]
-            a = verts[tri[0]]
-            b = verts[tri[1]]
-            c = verts[tri[2]]
-            q_hint = self._closest_point_on_triangle(p_local, a, b, c)
-            hint_dist2 = float(np.dot(p_local - q_hint, p_local - q_hint))
-            if hint_dist2 < 1e-6:
-                return self._barycentric_uv(q_hint, a, b, c), int(hint_face_id)
-        for fi in range(faces.shape[0]):
-            tri = faces[fi]
-            a = verts[tri[0]]
-            b = verts[tri[1]]
-            c = verts[tri[2]]
-            q = self._closest_point_on_triangle(p_local, a, b, c)
-            d2 = float(np.dot(p_local - q, p_local - q))
-            if d2 < best_d2:
-                best_d2 = d2
-                best_face = fi
-                best_q = q
-        tri = faces[best_face]
-        a = verts[tri[0]]
-        b = verts[tri[1]]
-        c = verts[tri[2]]
-        return self._barycentric_uv(best_q, a, b, c), int(best_face)
+    def _get_ekf_geom_adapter(self, mj_ho) -> MjEkfGeometryAdapter:
+        adapter = getattr(self, "_ekf_geom_adapter", None)
+        if adapter is None or adapter.mj_ho is not mj_ho:
+            adapter = MjEkfGeometryAdapter(mj_ho)
+            self._ekf_geom_adapter = adapter
+        return adapter
 
     def _map_contact_to_object_xi_with_hint(self, obj_body_id, c_world, hint_face_id=-1):
-        self._ekf_obj_hint_face_runtime = int(hint_face_id)
-        return self._map_contact_to_object_xi(obj_body_id, c_world)
+        return self._get_ekf_geom_adapter(self.mj_ho).map_contact_to_object_xi_with_hint(
+            obj_body_id=obj_body_id,
+            c_world=c_world,
+            hint_face_id=hint_face_id,
+        )
 
     def _map_contact_to_hand_surface(self, hand_body_id, c_world, n_obj, hint_face_id=-1):
-        self._ensure_hand_surface_cache(self.mj_ho)
-        rec = getattr(self, "_ekf_hand_mesh_by_body", {}).get(int(hand_body_id), None)
-        if rec is None:
-            return np.zeros((2,), dtype=float), -np.asarray(n_obj, dtype=float), -1
-        mesh = rec["mesh"]
-        face_normals = rec["face_normals"]
-        data = self.mj_ho.data
-        bpos = np.asarray(data.xpos[int(hand_body_id)], dtype=float)
-        brot = np.asarray(data.xmat[int(hand_body_id)], dtype=float).reshape(3, 3)
-        p_local = brot.T @ (np.asarray(c_world, dtype=float) - bpos)
-        verts = np.asarray(mesh.vertices, dtype=float)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-        best_d2 = float("inf")
-        best_face = 0
-        best_q = p_local
-        if 0 <= int(hint_face_id) < faces.shape[0]:
-            tri = faces[int(hint_face_id)]
-            a = verts[tri[0]]
-            b = verts[tri[1]]
-            c = verts[tri[2]]
-            q_hint = self._closest_point_on_triangle(p_local, a, b, c)
-            d2_hint = float(np.dot(p_local - q_hint, p_local - q_hint))
-            if d2_hint < 1e-6:
-                xi = self._barycentric_uv(q_hint, a, b, c)
-                n_local = np.asarray(face_normals[int(hint_face_id)], dtype=float)
-                n_world = brot @ n_local
-                n_world = n_world / (np.linalg.norm(n_world) + 1e-12)
-                return xi, n_world, int(hint_face_id)
-        for fi in range(faces.shape[0]):
-            tri = faces[fi]
-            a = verts[tri[0]]
-            b = verts[tri[1]]
-            c = verts[tri[2]]
-            q = self._closest_point_on_triangle(p_local, a, b, c)
-            d2 = float(np.dot(p_local - q, p_local - q))
-            if d2 < best_d2:
-                best_d2 = d2
-                best_face = fi
-                best_q = q
-        tri = faces[best_face]
-        a = verts[tri[0]]
-        b = verts[tri[1]]
-        c = verts[tri[2]]
-        xi = self._barycentric_uv(best_q, a, b, c)
-        n_local = np.asarray(face_normals[best_face], dtype=float)
-        n_world = brot @ n_local
-        n_world = n_world / (np.linalg.norm(n_world) + 1e-12)
-        return xi, n_world, int(best_face)
+        return self._get_ekf_geom_adapter(self.mj_ho).map_contact_to_hand_surface(
+            hand_body_id=hand_body_id,
+            c_world=c_world,
+            n_obj=n_obj,
+            hint_face_id=hint_face_id,
+        )
 
     def _build_hand_normal_fn(self, hand_body_id, face_id):
-        self._ensure_hand_surface_cache(self.mj_ho)
-        rec = getattr(self, "_ekf_hand_mesh_by_body", {}).get(int(hand_body_id), None)
-        if rec is None or int(face_id) < 0:
-            def _normal_fn(xi):
-                x = np.asarray(xi, dtype=float)
-                return np.zeros((x.shape[0], 3), dtype=float)
-            return _normal_fn
+        return self._get_ekf_geom_adapter(self.mj_ho).build_hand_normal_fn(
+            hand_body_id=hand_body_id,
+            face_id=face_id,
+        )
 
-        mesh = rec["mesh"]
-        verts = np.asarray(mesh.vertices, dtype=float)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-        tri = faces[int(face_id)]
-        a = verts[tri[0]]
-        b = verts[tri[1]]
-        c = verts[tri[2]]
-        data = self.mj_ho.data
-        brot = np.asarray(data.xmat[int(hand_body_id)], dtype=float).reshape(3, 3)
-
-        def _normal_fn(xi_batch):
-            xi_batch = np.asarray(xi_batch, dtype=float).reshape(-1, 2)
-            out = np.zeros((xi_batch.shape[0], 3), dtype=float)
-            # triangle plane normal is constant; this still allows Eq.(11) interface closure.
-            n_local = np.cross(b - a, c - a)
-            n_world = brot @ n_local
-            n_world = n_world / (np.linalg.norm(n_world) + 1e-12)
-            out[:] = n_world.reshape(1, 3)
-            return out
-
-        return _normal_fn
+    def _build_motion_grasp_matrices(
+        self,
+        mj_ho,
+        c_obj: np.ndarray,
+        J_obs_contact: np.ndarray,
+        m: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self._get_ekf_geom_adapter(mj_ho).build_motion_grasp_matrices(
+            c_obj=c_obj,
+            J_obs_contact=J_obs_contact,
+            m=m,
+        )
 
     def _simulate_under_extforce_details(self, pre_obj_qpos):
         ekf_logger = None
@@ -313,7 +94,13 @@ class tabletopArmEval(BaseEval):
             "step": 0,
             "contact_cache": None,
             "contact_stats": None,
+            "no_contact_streak": 0,
+            "pose_metrics": None,
         }
+        if getattr(self.configs.task, "ekf_pose_eval_enable", True):
+            ekf_ctx["pose_metrics"] = EkfPoseMetricsTracker(
+                print_every=int(getattr(self.configs.task, "ekf_pose_eval_print_every", 50))
+            )
         if getattr(self.configs.task, "ekf_input_debug", False):
             ekf_logger = EkfOnlineInputLogger(
                 print_every=getattr(self.configs.task, "ekf_input_print_every", 20)
@@ -363,13 +150,8 @@ class tabletopArmEval(BaseEval):
             )
 
             # 6. Lift the object
-            if ekf_logger is not None and ekf_stage == "post_lift":
-                if run_ekf_smoke:
-                    self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
-                        mj, ekf_logger, ekf_ctx
-                    )
-                else:
-                    self.mj_ho.step_callback = ekf_logger.on_step
+            # NOTE: For strict "post-lift" evaluation, do NOT run EKF during lift.
+            # EKF callback is enabled only after this lift interpolation finishes.
             self.mj_ho.control_hand_with_interp(
                 self.grasp_data["squeeze_qpos"],
                 self.grasp_data["lift_qpos"],
@@ -378,6 +160,12 @@ class tabletopArmEval(BaseEval):
             # 7. Hold-and-observe stage after lift.
             # -1 means "keep printing while viewer is open".
             if ekf_logger is not None and ekf_stage == "post_lift":
+                if run_ekf_smoke:
+                    self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
+                        mj, ekf_logger, ekf_ctx
+                    )
+                else:
+                    self.mj_ho.step_callback = ekf_logger.on_step
                 post_lift_steps = int(
                     getattr(self.configs.task, "ekf_input_post_lift_steps", 2000)
                 )
@@ -389,6 +177,9 @@ class tabletopArmEval(BaseEval):
         finally:
             if ekf_logger is not None:
                 self.mj_ho.step_callback = None
+            pose_metrics = ekf_ctx.get("pose_metrics")
+            if pose_metrics is not None:
+                pose_metrics.emit_summary()
 
         return
 
@@ -409,6 +200,9 @@ class tabletopArmEval(BaseEval):
             # Minimal x0 hint: object position + zero orientation components.
             x0_hint = np.zeros((6,), dtype=float)
             x0_hint[:3] = np.asarray(x_gt[:3], dtype=float)
+            # MuJoCo free joint pose = [x, y, z, qw, qx, qy, qz].
+            # Initialize orientation from GT to avoid constant bias in absolute-pose metrics.
+            x0_hint[3:6] = quat_wxyz_to_rotvec(np.asarray(x_gt[3:7], dtype=float))
             init_cfg = EkfInitConfig(init_contacts=0, x0_std=0.0, seed=0)
             state0 = build_initial_state(x0_hint=x0_hint, cfg=init_cfg)
             P0 = build_initial_covariance(state0=state0, cfg=init_cfg)
@@ -420,10 +214,12 @@ class tabletopArmEval(BaseEval):
         P_prev: np.ndarray = ekf_ctx["P"]
 
         m = q.shape[0]
-        # Placeholder matrices for smoke integration only.
-        G_pinv = np.eye(6, dtype=float)
-        J_motion = np.zeros((6, m), dtype=float)
-        R_t = np.eye(2 * m, dtype=float) * 1e-3
+        r_q = float(getattr(self.configs.task, "ekf_r_q", 1e-3))
+        r_tau = float(getattr(self.configs.task, "ekf_r_tau", 1e-3))
+        q_x = float(getattr(self.configs.task, "ekf_q_x", 1e-4))
+        q_xi = float(getattr(self.configs.task, "ekf_q_xi", 1e-4))
+        q_f = float(getattr(self.configs.task, "ekf_q_f", 1e-4))
+        R_t = self._build_R_block_diag(m=m, r_q=r_q, r_tau=r_tau)
         (
             c_obj,
             c_f_prev,
@@ -444,10 +240,20 @@ class tabletopArmEval(BaseEval):
             obj_xi_mapper=self._map_contact_to_object_xi_with_hint,
             hand_surface_mapper=self._map_contact_to_hand_surface,
             hand_normal_fn_builder=self._build_hand_normal_fn,
+            rho_plus=float(getattr(self.configs.task, "ekf_contact_rho_plus", 0.05)),
+            rho_minus=float(getattr(self.configs.task, "ekf_contact_rho_minus", 0.02)),
+            contact_score_eps=float(getattr(self.configs.task, "ekf_contact_score_eps", 1e-9)),
+        )
+        G_pinv, J_motion = self._build_motion_grasp_matrices(
+            mj_ho=mj_ho,
+            c_obj=c_obj,
+            J_obs_contact=J_obs_contact,
+            m=m,
         )
         state_work = state_prev
         P_work = P_prev
-        Q_work = np.eye(state_work.dim, dtype=float) * 1e-4
+        Q_work = self._build_Q_block_diag(state=state_work, q_x=q_x, q_xi=q_xi, q_f=q_f)
+        Q_prev_local = Q_work.copy()
         if len(match_events.lost_prev_idx) > 0:
             state_work, P_work, Q_work = shrink_state_cov_for_lost_contacts(
                 state_prev=state_work,
@@ -455,6 +261,9 @@ class tabletopArmEval(BaseEval):
                 Q_prev=Q_work,
                 lost_prev_idx=match_events.lost_prev_idx,
             )
+        state_after_shrink = state_work
+        P_after_shrink = P_work
+        Q_after_shrink = Q_work
         if len(match_events.new_curr_idx) > 0:
             state_work, P_work, Q_work = expand_state_cov_for_new_contacts(
                 state_prev=state_work,
@@ -463,10 +272,46 @@ class tabletopArmEval(BaseEval):
                 new_count=len(match_events.new_curr_idx),
                 xi_init=xi_new_init,
                 f_init=f_new_init,
+                q_new_var=q_xi,
+            )
+        # Keep process noise consistent with configured block-diagonal policy.
+        Q_work = self._build_Q_block_diag(state=state_work, q_x=q_x, q_xi=q_xi, q_f=q_f)
+        state_after_expand = state_work
+        P_after_expand = P_work
+        Q_after_expand = Q_work
+
+        audit_enable = bool(getattr(self.configs.task, "ekf_audit_enable", False))
+        audit_every = int(getattr(self.configs.task, "ekf_audit_every", 20))
+        if audit_enable and audit_every > 0 and (ekf_ctx["step"] % audit_every == 0):
+            audit_state_cov_contact_alignment(
+                state_prev=state_prev,
+                P_prev=P_prev,
+                Q_prev=Q_prev_local,
+                state_after_shrink=state_after_shrink,
+                P_after_shrink=P_after_shrink,
+                Q_after_shrink=Q_after_shrink,
+                state_after_expand=state_after_expand,
+                P_after_expand=P_after_expand,
+                Q_after_expand=Q_after_expand,
+                match_events=match_events,
+                xi_new_init=xi_new_init,
+                f_new_init=f_new_init,
             )
 
         ekf_ctx["contact_cache"] = next_cache
         ekf_ctx["contact_stats"] = match_stats
+        if state_work.n_contacts == 0:
+            ekf_ctx["no_contact_streak"] = int(ekf_ctx.get("no_contact_streak", 0)) + 1
+        else:
+            ekf_ctx["no_contact_streak"] = 0
+        no_contact_steps_thr = int(
+            getattr(self.configs.task, "ekf_no_contact_steps_threshold", 8)
+        )
+        if ekf_ctx["no_contact_streak"] >= max(1, no_contact_steps_thr):
+            tau_r_scale = float(
+                getattr(self.configs.task, "ekf_no_contact_tau_R_scale", 100.0)
+            )
+            R_t[m:, m:] *= tau_r_scale
         J_obs = np.asarray(J_obs_contact, dtype=float)
         if J_obs.shape != (3 * state_work.n_contacts, m):
             raise RuntimeError(
@@ -496,6 +341,15 @@ class tabletopArmEval(BaseEval):
 
         ekf_ctx["state"] = InhandState.unpack(step_res.ekf_update.y_next)
         ekf_ctx["P"] = step_res.ekf_update.P_next
+        pose_metrics = ekf_ctx.get("pose_metrics")
+        if pose_metrics is not None:
+            pose_metrics.update(
+                step=ekf_ctx["step"],
+                x_est6=ekf_ctx["state"].x,
+                x_gt7=x_gt,
+                n_contacts=ekf_ctx["state"].n_contacts,
+            )
+        g_sanity_enable = bool(getattr(self.configs.task, "ekf_g_sanity_enable", False))
 
         smoke_every = int(getattr(self.configs.task, "ekf_smoke_print_every", 50))
         if smoke_every > 0 and ekf_ctx["step"] % smoke_every == 0:
@@ -508,6 +362,7 @@ class tabletopArmEval(BaseEval):
             innov_norm = float(np.linalg.norm(step_res.ekf_update.innovation))
             contact_stats = ekf_ctx.get("contact_stats")
             contact_stat_txt = ""
+            g_sanity_txt = ""
             warn_txt = ""
             if contact_stats is not None:
                 changed = contact_stats.new_count + contact_stats.lost_count
@@ -529,6 +384,29 @@ class tabletopArmEval(BaseEval):
                         f"{change_ratio:.3f}{color_reset} "
                         f"{color_key}(thr={warn_threshold:.3f}){color_reset}"
                     )
+            if g_sanity_enable:
+                g_rows = int(J_motion.shape[0]) if J_motion.ndim == 2 else 0
+                g_cols = int(J_motion.shape[1]) if J_motion.ndim == 2 else 0
+                rank_g = 0
+                cond_g = 0.0
+                pred_norm = 0.0
+                if (
+                    G_pinv.ndim == 2
+                    and J_motion.ndim == 2
+                    and J_motion.shape[1] == u_t.shape[0]
+                ):
+                    if G_pinv.shape[1] > 0:
+                        G = np.linalg.pinv(G_pinv)
+                        rank_g = int(np.linalg.matrix_rank(G))
+                        try:
+                            cond_g = float(np.linalg.cond(G))
+                        except np.linalg.LinAlgError:
+                            cond_g = float("inf")
+                        pred_norm = float(np.linalg.norm(G_pinv @ J_motion @ u_t))
+                    g_sanity_txt = (
+                        f" {color_key}Gsanity(rows,cols,rank,cond,|G+Ju|)={color_reset}"
+                        f"{color_val}{g_rows},{g_cols},{rank_g},{cond_g:.3e},{pred_norm:.3e}{color_reset}"
+                    )
             print(
                 f"{color_tag}[EKF-SMOKE]{color_reset} "
                 f"{color_key}step={color_reset}{color_val}{ekf_ctx['step']}{color_reset} "
@@ -537,6 +415,7 @@ class tabletopArmEval(BaseEval):
                 f"{color_key}dim_x={color_reset}{color_val}{step_res.ekf_update.y_next.shape[0]}{color_reset} "
                 f"{color_key}|innov|={color_reset}{color_val}{innov_norm:.6f}{color_reset}"
                 f"{contact_stat_txt}"
+                f"{g_sanity_txt}"
                 f"{warn_txt}"
             )
 

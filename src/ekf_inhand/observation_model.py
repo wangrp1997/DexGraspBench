@@ -5,6 +5,23 @@ import numpy as np
 from .state import InhandState
 
 
+def _project_uv_to_triangle_domain(xi: np.ndarray) -> np.ndarray:
+    """
+    Project barycentric uv parameters to the valid triangle domain:
+      v >= 0, w >= 0, v + w <= 1
+    """
+    x = np.asarray(xi, dtype=float).reshape(-1, 2).copy()
+    x[:, 0] = np.maximum(x[:, 0], 0.0)
+    x[:, 1] = np.maximum(x[:, 1], 0.0)
+    s = x[:, 0] + x[:, 1]
+    over = s > 1.0
+    if np.any(over):
+        # Radial projection onto the simplex edge v + w = 1.
+        x[over, 0] /= s[over]
+        x[over, 1] /= s[over]
+    return x
+
+
 def h_tau_eq12_13(
     state: InhandState,
     J: np.ndarray,
@@ -160,7 +177,9 @@ def xi_f_update_eq11(
 
     normal_err = (-n_obj_t) - n_f_prev  # (n,3)
     delta_xi = np.einsum("nij,nj->ni", dn_f_dxi_at_prev, normal_err)  # (n,2)
-    return xi_f_prev + delta_xi
+    xi_next = xi_f_prev + delta_xi
+    # Keep xi_f on the valid triangle parameter domain.
+    return _project_uv_to_triangle_domain(xi_next)
 
 
 def approx_dn_f_dxi_numeric(
@@ -169,7 +188,7 @@ def approx_dn_f_dxi_numeric(
     eps: float = 1e-6,
 ) -> np.ndarray:
     """
-    Numerical approximation of ∂n_f/∂xi_f with forward finite differences.
+    Numerical approximation of ∂n_f/∂xi_f with central finite differences.
 
     Args:
       xi_f_prev: (n,2)
@@ -185,18 +204,29 @@ def approx_dn_f_dxi_numeric(
         raise ValueError(f"eps must be > 0, got {eps}")
 
     n = xi_f_prev.shape[0]
-    n0 = np.asarray(normal_fn(xi_f_prev), dtype=float)
-    if n0.shape != (n, 3):
-        raise ValueError(f"normal_fn(xi_f_prev) must return {(n,3)}, got {n0.shape}")
-
+    # Fixed stability range to avoid too small/too large finite-diff steps.
+    eps_eff = float(np.clip(float(eps), 1e-7, 1e-4))
+    xi_center = _project_uv_to_triangle_domain(xi_f_prev)
     dn = np.zeros((n, 2, 3), dtype=float)
     for k in range(2):
-        xi_eps = xi_f_prev.copy()
-        xi_eps[:, k] += eps
-        nk = np.asarray(normal_fn(xi_eps), dtype=float)
-        if nk.shape != (n, 3):
-            raise ValueError(f"normal_fn(xi_eps) must return {(n,3)}, got {nk.shape}")
-        dn[:, k, :] = (nk - n0) / eps
+        xi_plus = xi_center.copy()
+        xi_minus = xi_center.copy()
+        xi_plus[:, k] += eps_eff
+        xi_minus[:, k] -= eps_eff
+        xi_plus = _project_uv_to_triangle_domain(xi_plus)
+        xi_minus = _project_uv_to_triangle_domain(xi_minus)
+        n_plus = np.asarray(normal_fn(xi_plus), dtype=float)
+        n_minus = np.asarray(normal_fn(xi_minus), dtype=float)
+        if n_plus.shape != (n, 3):
+            raise ValueError(f"normal_fn(xi_plus) must return {(n,3)}, got {n_plus.shape}")
+        if n_minus.shape != (n, 3):
+            raise ValueError(f"normal_fn(xi_minus) must return {(n,3)}, got {n_minus.shape}")
+        step = (xi_plus[:, k] - xi_minus[:, k]).reshape(-1, 1)
+        # Boundary-safe derivative: fallback to nominal denominator when step is tiny.
+        tiny = np.abs(step[:, 0]) < 1e-12
+        if np.any(tiny):
+            step[tiny, 0] = 2.0 * eps_eff
+        dn[:, k, :] = (n_plus - n_minus) / step
     return dn
 
 

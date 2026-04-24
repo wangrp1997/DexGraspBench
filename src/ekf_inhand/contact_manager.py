@@ -38,6 +38,37 @@ class ContactMatchEvents:
 ContactCache = dict[ContactKey, list[dict[str, np.ndarray | int]]]
 
 
+def _estimate_contact_force_eq23(
+    J_block: np.ndarray,
+    n_obj: np.ndarray,
+    tau_meas: np.ndarray,
+    eps: float = 1e-10,
+) -> float:
+    """
+    Paper Eq.(23) scalar least-squares inversion:
+      f_j = (J_j^T n_j)^+ tau
+
+    For scalar f_j, this is equivalent to solving
+      min_f ||a_j * f - tau||_2, where a_j = J_j^T n_j (shape m,).
+
+    - Regular case (||a_j|| > eps): closed-form LS
+        f_j = (a_j^T tau) / (a_j^T a_j)
+      which equals Moore-Penrose pseudoinverse.
+    - Degenerate case (||a_j|| <= eps): return 0.0
+      to keep the estimator numerically safe and deterministic.
+    """
+    a_j = np.asarray(J_block, dtype=float).T @ np.asarray(n_obj, dtype=float).reshape(3)
+    tau = np.asarray(tau_meas, dtype=float).reshape(-1)
+    if a_j.shape != tau.shape:
+        raise ValueError(
+            f"Eq.(23) dimension mismatch: a_j {a_j.shape} vs tau {tau.shape}"
+        )
+    denom = float(np.dot(a_j, a_j))
+    if denom <= float(eps):
+        return 0.0
+    return float(np.dot(a_j, tau) / denom)
+
+
 def build_hq_inputs_with_contact_matching(
     mj_ho,
     m: int,
@@ -47,6 +78,9 @@ def build_hq_inputs_with_contact_matching(
     obj_xi_mapper=None,
     hand_surface_mapper=None,
     hand_normal_fn_builder=None,
+    rho_plus: float | None = None,
+    rho_minus: float | None = None,
+    contact_score_eps: float = 1e-9,
     nearest_dist_threshold: float = 5e-3,
 ):
     """
@@ -114,6 +148,12 @@ def build_hq_inputs_with_contact_matching(
     persist_curr_idx: list[int] = []
     new_curr_idx: list[int] = []
 
+    if (rho_plus is None) != (rho_minus is None):
+        raise ValueError("rho_plus and rho_minus must be both set or both None")
+    use_hysteresis = rho_plus is not None and rho_minus is not None
+    if use_hysteresis and float(rho_plus) <= float(rho_minus):
+        raise ValueError("hysteresis requires rho_plus > rho_minus")
+
     for contact in data.contact:
         geom1_id = int(contact.geom1)
         geom2_id = int(contact.geom2)
@@ -150,12 +190,32 @@ def build_hq_inputs_with_contact_matching(
             obj_geom_id=obj_geom_id,
         )
 
+        jacp = np.zeros((3, model.nv), dtype=float)
+        jacr = np.zeros((3, model.nv), dtype=float)
+        mujoco.mj_jac(model, data, jacp, jacr, c_pos, hand_body_id)
+        J_block = jacp[:, finger_dof_idx]
+        # Eq.(23): f_j = (J_j^T n_j)^+ tau
+        # Here we use equivalent scalar LS closed-form with explicit degeneracy guard.
+        f_j = _estimate_contact_force_eq23(
+            J_block=J_block,
+            n_obj=n_obj,
+            tau_meas=tau_meas,
+        )
+        d_eff = float(contact.dist) if float(contact.dist) > float(contact_score_eps) else float(contact_score_eps)
+        w_j = abs(float(f_j)) / np.sqrt(d_eff)
+
         curr_idx = len(c_obj_lst)
         # finger-side current mapping (Eq.(10)(11) related quantities)
         xi_f_curr = np.zeros((2,), dtype=float)
         n_f_curr = -n_obj.copy()
         face_id_curr = -1
         prev_candidates = grouped_prev.get(key, [])
+        was_in_contact = len(prev_candidates) > 0
+        if use_hysteresis:
+            if (not was_in_contact) and (w_j <= float(rho_plus)):
+                continue
+            if was_in_contact and (w_j < float(rho_minus)):
+                continue
         obj_face_id_curr = -1
         if len(prev_candidates) > 0:
             dists = np.array(
@@ -266,18 +326,6 @@ def build_hq_inputs_with_contact_matching(
                 xi_f_curr = np.asarray(xi_f_curr, dtype=float).reshape(-1)
                 n_f_curr = np.asarray(n_f_curr, dtype=float).reshape(-1)
                 face_id_curr = int(face_id_curr)
-
-        jacp = np.zeros((3, model.nv), dtype=float)
-        jacr = np.zeros((3, model.nv), dtype=float)
-        mujoco.mj_jac(model, data, jacp, jacr, c_pos, hand_body_id)
-        J_block = jacp[:, finger_dof_idx]
-
-        # Eq.(23): f_j = (J_j^T n_j)^+ * tau
-        # Here a_j = J_j^T n_j in R^m and f_j is scalar.
-        a_j = J_block.T @ n_obj  # (m,)
-        # Eq.(23): scalar least-squares with pseudoinverse.
-        # A = a_j as (m,1) => A^+ shape (1,m), then f_j = A^+ @ tau (scalar).
-        f_j = float(np.linalg.pinv(a_j.reshape(-1, 1)) @ tau_meas.reshape(-1, 1))
 
         c_obj_lst.append(c_pos)
         c_f_prev_lst.append(c_prev)
@@ -441,3 +489,94 @@ def expand_state_cov_for_new_contacts(
         P_new[f_start + i, f_start + i] = float(f_init_var)
         Q_new[f_start + i, f_start + i] = float(q_new_var)
     return state_new, P_new, Q_new
+
+
+def audit_state_cov_contact_alignment(
+    state_prev: InhandState,
+    P_prev: np.ndarray,
+    Q_prev: np.ndarray,
+    state_after_shrink: InhandState,
+    P_after_shrink: np.ndarray,
+    Q_after_shrink: np.ndarray,
+    state_after_expand: InhandState,
+    P_after_expand: np.ndarray,
+    Q_after_expand: np.ndarray,
+    match_events: ContactMatchEvents,
+    xi_new_init: np.ndarray,
+    f_new_init: np.ndarray,
+) -> None:
+    """
+    Audit Eq.(24)(25) index consistency across:
+      - state y packing ([x, xi, f])
+      - covariance blocks P/Q
+      - contact add/remove events
+    Raises RuntimeError on any mismatch.
+    """
+    n_prev = state_prev.n_contacts
+    if match_events.prev_count != n_prev:
+        raise RuntimeError(
+            f"audit failed: events.prev_count={match_events.prev_count} != state_prev.n_contacts={n_prev}"
+        )
+    if P_prev.shape != (state_prev.dim, state_prev.dim):
+        raise RuntimeError(f"audit failed: P_prev shape {P_prev.shape} != {(state_prev.dim, state_prev.dim)}")
+    if Q_prev.shape != (state_prev.dim, state_prev.dim):
+        raise RuntimeError(f"audit failed: Q_prev shape {Q_prev.shape} != {(state_prev.dim, state_prev.dim)}")
+
+    lost_set = set(int(i) for i in match_events.lost_prev_idx)
+    keep = [i for i in range(n_prev) if i not in lost_set]
+    n_keep = len(keep)
+    if state_after_shrink.n_contacts != n_keep:
+        raise RuntimeError(
+            f"audit failed after shrink: n_contacts={state_after_shrink.n_contacts} expected={n_keep}"
+        )
+    if not np.allclose(state_after_shrink.x, state_prev.x):
+        raise RuntimeError("audit failed after shrink: x block changed unexpectedly")
+
+    xi_expect = (
+        np.concatenate([state_prev.xi[2 * i : 2 * i + 2] for i in keep], axis=0)
+        if n_keep > 0
+        else np.zeros((0,), dtype=float)
+    )
+    f_expect = (
+        np.concatenate([state_prev.f[i : i + 1] for i in keep], axis=0)
+        if n_keep > 0
+        else np.zeros((0,), dtype=float)
+    )
+    if not np.allclose(state_after_shrink.xi, xi_expect):
+        raise RuntimeError("audit failed after shrink: xi order/content mismatch")
+    if not np.allclose(state_after_shrink.f, f_expect):
+        raise RuntimeError("audit failed after shrink: f order/content mismatch")
+    if P_after_shrink.shape != (state_after_shrink.dim, state_after_shrink.dim):
+        raise RuntimeError("audit failed after shrink: P shape mismatch")
+    if Q_after_shrink.shape != (state_after_shrink.dim, state_after_shrink.dim):
+        raise RuntimeError("audit failed after shrink: Q shape mismatch")
+
+    k_new = len(match_events.new_curr_idx)
+    if state_after_expand.n_contacts != n_keep + k_new:
+        raise RuntimeError(
+            f"audit failed after expand: n_contacts={state_after_expand.n_contacts} expected={n_keep + k_new}"
+        )
+    if not np.allclose(state_after_expand.x, state_after_shrink.x):
+        raise RuntimeError("audit failed after expand: x block changed unexpectedly")
+
+    xi_new_init = np.asarray(xi_new_init, dtype=float).reshape(-1)
+    f_new_init = np.asarray(f_new_init, dtype=float).reshape(-1)
+    if xi_new_init.shape[0] != 2 * k_new:
+        raise RuntimeError(
+            f"audit failed after expand: xi_new_init shape {xi_new_init.shape} != {(2 * k_new,)}"
+        )
+    if f_new_init.shape[0] != k_new:
+        raise RuntimeError(
+            f"audit failed after expand: f_new_init shape {f_new_init.shape} != {(k_new,)}"
+        )
+
+    xi_expand_expect = np.concatenate([state_after_shrink.xi, xi_new_init], axis=0)
+    f_expand_expect = np.concatenate([state_after_shrink.f, f_new_init], axis=0)
+    if not np.allclose(state_after_expand.xi, xi_expand_expect):
+        raise RuntimeError("audit failed after expand: xi append/order mismatch")
+    if not np.allclose(state_after_expand.f, f_expand_expect):
+        raise RuntimeError("audit failed after expand: f append/order mismatch")
+    if P_after_expand.shape != (state_after_expand.dim, state_after_expand.dim):
+        raise RuntimeError("audit failed after expand: P shape mismatch")
+    if Q_after_expand.shape != (state_after_expand.dim, state_after_expand.dim):
+        raise RuntimeError("audit failed after expand: Q shape mismatch")
