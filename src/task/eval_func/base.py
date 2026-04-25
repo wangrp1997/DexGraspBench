@@ -281,6 +281,8 @@ class BaseEval:
         np.save(eval_npy_path, eval_results)
 
         # In interactive debug mode, keep the MuJoCo window alive until user closes it.
-        if self.configs.task.debug_viewer:
+        if self.configs.task.debug_viewer and not bool(
+            getattr(self.configs.task, "debug_viewer_autoclose", False)
+        ):
             self.mj_ho.wait_until_viewer_closed()
         return

@@ -3,6 +3,7 @@ obj_mass: 0.1   # unit: kg
 miu_coef: [0.6, 0.02]
 debug_render: False
 debug_viewer: False
+debug_viewer_autoclose: False  # batch-only: True to skip manual wait_until_viewer_closed
 debug_dir: ${save_dir}/debug
 
 # Real-gravity variant:
