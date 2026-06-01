@@ -22,6 +22,31 @@ from ekf_inhand.state import InhandState
 
 class tabletopArmEval(BaseEval):
     @staticmethod
+    def _physical_pre_obj_qpos(pre_obj_qpos: np.ndarray, setting: str) -> np.ndarray:
+        """Strip tabletop success-metric z offset (+0.1 m) from pre_obj_qpos."""
+        q = np.asarray(pre_obj_qpos, dtype=float).reshape(-1).copy()
+        if setting == "tabletop":
+            q[2] -= 0.1
+        return q
+
+    def _resolve_nominal_obj_qpos_ref(self, ekf_ctx: dict) -> np.ndarray:
+        """
+        Nominal EKF init should match when filtering starts, not the eval-only
+        pre_obj_qpos reference (which adds +0.1 m on tabletop).
+        """
+        ekf_stage = getattr(self.configs.task, "ekf_input_stage", "post_lift")
+        if ekf_stage == "post_lift":
+            lift_ref = ekf_ctx.get("lift_end_obj_qpos")
+            if lift_ref is not None:
+                return np.asarray(lift_ref, dtype=float).reshape(-1).copy()
+        squeeze_ref = ekf_ctx.get("squeeze_end_obj_qpos")
+        if squeeze_ref is not None:
+            return np.asarray(squeeze_ref, dtype=float).reshape(-1).copy()
+        return self._physical_pre_obj_qpos(
+            ekf_ctx["pre_obj_qpos"], self.configs.setting
+        )
+
+    @staticmethod
     def _x6_to_pose7(x_est6: np.ndarray) -> np.ndarray:
         x_est6 = np.asarray(x_est6, dtype=float).reshape(-1)
         if x_est6.shape[0] != 6:
@@ -111,6 +136,8 @@ class tabletopArmEval(BaseEval):
             "pose_metrics": None,
             "init_logged": False,
             "pre_obj_qpos": np.asarray(pre_obj_qpos, dtype=float).reshape(-1).copy(),
+            "squeeze_end_obj_qpos": None,
+            "lift_end_obj_qpos": None,
         }
         if getattr(self.configs.task, "ekf_pose_eval_enable", True):
             pose_output_dir = str(
@@ -172,6 +199,9 @@ class tabletopArmEval(BaseEval):
                 self.grasp_data["grasp_qpos"],
                 self.grasp_data["squeeze_qpos"],
             )
+            ekf_ctx["squeeze_end_obj_qpos"] = np.asarray(
+                self.mj_ho.get_obj_pose(), dtype=float
+            ).reshape(-1).copy()
 
             # 6. Lift the object
             # NOTE: For strict "post-lift" evaluation, do NOT run EKF during lift.
@@ -180,6 +210,9 @@ class tabletopArmEval(BaseEval):
                 self.grasp_data["squeeze_qpos"],
                 self.grasp_data["lift_qpos"],
             )
+            ekf_ctx["lift_end_obj_qpos"] = np.asarray(
+                self.mj_ho.get_obj_pose(), dtype=float
+            ).reshape(-1).copy()
 
             # 7. Hold-and-observe stage after lift.
             # -1 means "keep printing while viewer is open".
@@ -240,13 +273,20 @@ class tabletopArmEval(BaseEval):
                     rot_noise = rng.normal(0.0, np.deg2rad(sigma_rot_deg), size=3)
                     x0_hint[3:6] = x0_hint[3:6] + rot_noise
             elif init_mode == "nominal":
-                pre_obj_qpos = np.asarray(ekf_ctx["pre_obj_qpos"], dtype=float).reshape(-1)
-                if pre_obj_qpos.shape[0] < 7:
+                nominal_ref = self._resolve_nominal_obj_qpos_ref(ekf_ctx)
+                if nominal_ref.shape[0] < 7:
                     raise ValueError(
-                        f"pre_obj_qpos must have at least 7 dims, got {pre_obj_qpos.shape}"
+                        f"nominal_obj_qpos_ref must have at least 7 dims, got {nominal_ref.shape}"
                     )
-                x0_hint[:3] = pre_obj_qpos[:3]
-                x0_hint[3:6] = quat_wxyz_to_rotvec(pre_obj_qpos[3:7])
+                nominal_ref_name = "pre_grasp_physical"
+                if ekf_ctx.get("lift_end_obj_qpos") is not None and getattr(
+                    self.configs.task, "ekf_input_stage", "post_lift"
+                ) == "post_lift":
+                    nominal_ref_name = "lift_end"
+                elif ekf_ctx.get("squeeze_end_obj_qpos") is not None:
+                    nominal_ref_name = "squeeze_end"
+                x0_hint[:3] = nominal_ref[:3]
+                x0_hint[3:6] = quat_wxyz_to_rotvec(nominal_ref[3:7])
                 sigma_pos = float(
                     getattr(self.configs.task, "ekf_init_nominal_pos_sigma", 0.02)
                 )
@@ -263,9 +303,15 @@ class tabletopArmEval(BaseEval):
                     f"Unsupported ekf_init_mode={init_mode}, expected gt_exact / gt_perturbed / nominal"
                 )
             if not ekf_ctx["init_logged"]:
+                init_extra = ""
+                if init_mode == "nominal":
+                    init_extra = (
+                        f" \033[94mref=\033[0m\033[92m{nominal_ref_name}\033[0m"
+                    )
                 print(
                     f"\033[95m[EKF-INIT]\033[0m "
-                    f"\033[94mmode=\033[0m\033[92m{init_mode}\033[0m "
+                    f"\033[94mmode=\033[0m\033[92m{init_mode}\033[0m"
+                    f"{init_extra} "
                     f"\033[94mx0_pos=\033[0m\033[92m{x0_hint[:3]}\033[0m "
                     f"\033[94mx0_rotvec=\033[0m\033[92m{x0_hint[3:6]}\033[0m"
                 )
