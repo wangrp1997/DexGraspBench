@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 
 class MjEkfGeometryAdapter:
@@ -146,6 +147,53 @@ class MjEkfGeometryAdapter:
         import trimesh  # type: ignore[import-not-found]
 
         self._obj_mesh_local = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    def _object_point_from_uv(self, xi_uv: np.ndarray, face_id: int) -> np.ndarray:
+        self.ensure_object_surface_cache()
+        mesh = self._obj_mesh_local
+        if mesh is None:
+            return np.zeros((3,), dtype=float)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        verts = np.asarray(mesh.vertices, dtype=float)
+        fi = int(face_id)
+        if fi < 0 or fi >= faces.shape[0]:
+            fi = 0
+        tri = faces[fi]
+        a = verts[tri[0]]
+        b = verts[tri[1]]
+        c = verts[tri[2]]
+        uv = np.asarray(xi_uv, dtype=float).reshape(2)
+        v = float(uv[0])
+        w = float(uv[1])
+        u = 1.0 - v - w
+        return u * a + v * b + w * c
+
+    def object_contact_points_from_state(
+        self,
+        x6: np.ndarray,
+        xi: np.ndarray,
+        face_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Map object-surface parameters (xi, face) + pose x6 to world contact points."""
+        x6 = np.asarray(x6, dtype=float).reshape(6)
+        xi = np.asarray(xi, dtype=float)
+        face_ids = np.asarray(face_ids, dtype=int).reshape(-1)
+        if xi.ndim == 1:
+            if xi.shape[0] % 2 != 0:
+                raise ValueError(f"xi must be shape (n,2), got {xi.shape}")
+            xi = xi.reshape(-1, 2)
+        n = xi.shape[0]
+        if face_ids.shape[0] != n:
+            raise ValueError(
+                f"face_ids length {face_ids.shape[0]} must match n={n} contacts"
+            )
+        rot = R.from_rotvec(x6[3:6]).as_matrix()
+        trans = x6[:3]
+        pts = np.zeros((n, 3), dtype=float)
+        for i in range(n):
+            p_body = self._object_point_from_uv(xi[i], int(face_ids[i]))
+            pts[i] = rot @ p_body + trans
+        return pts
 
     def ensure_hand_surface_cache(self):
         if self._hand_mesh_by_body is not None:

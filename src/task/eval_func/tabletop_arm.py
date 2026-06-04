@@ -16,6 +16,7 @@ from ekf_inhand.init import build_initial_state
 from ekf_inhand.mj_geometry_adapter import MjEkfGeometryAdapter
 from ekf_inhand.pose_metrics import EkfPoseMetricsTracker
 from ekf_inhand.pose_metrics import quat_wxyz_to_rotvec
+from ekf_inhand.observation_model import h_q_eq8_11
 from ekf_inhand.runner import run_one_step_smoke
 from ekf_inhand.state import InhandState
 
@@ -29,21 +30,52 @@ class tabletopArmEval(BaseEval):
             q[2] -= 0.1
         return q
 
-    def _resolve_nominal_obj_qpos_ref(self, ekf_ctx: dict) -> np.ndarray:
+    def _resolve_nominal_obj_qpos_ref(self, ekf_ctx: dict) -> tuple[np.ndarray, str]:
         """
-        Nominal EKF init should match when filtering starts, not the eval-only
-        pre_obj_qpos reference (which adds +0.1 m on tabletop).
+        Resolve blind nominal object pose for EKF init (7D MuJoCo qpos, no sim peek).
+
+        ekf_init_nominal_ref:
+          - grasp: grasp_data["obj_pose"] from dataset/planner
+          - pre_grasp: pre-squeeze sim pose (tabletop +0.1 m eval offset stripped)
+          - lift_end: sim pose at end of lift (semi-oracle, debugging only)
+          - squeeze_end: sim pose at end of squeeze (semi-oracle)
         """
-        ekf_stage = getattr(self.configs.task, "ekf_input_stage", "post_lift")
-        if ekf_stage == "post_lift":
+        ref_key = str(
+            getattr(self.configs.task, "ekf_init_nominal_ref", "grasp")
+        ).lower()
+        if ref_key == "grasp":
+            if not hasattr(self, "grasp_data") or "obj_pose" not in self.grasp_data:
+                raise ValueError(
+                    "ekf_init_nominal_ref=grasp requires grasp_data['obj_pose']"
+                )
+            ref = np.asarray(self.grasp_data["obj_pose"], dtype=float).reshape(-1).copy()
+            if ref.shape[0] < 7:
+                raise ValueError(
+                    f"grasp_data['obj_pose'] must have at least 7 dims, got {ref.shape}"
+                )
+            return ref, "grasp"
+        if ref_key == "pre_grasp":
+            ref = self._physical_pre_obj_qpos(
+                ekf_ctx["pre_obj_qpos"], self.configs.setting
+            )
+            return ref, "pre_grasp"
+        if ref_key == "lift_end":
             lift_ref = ekf_ctx.get("lift_end_obj_qpos")
-            if lift_ref is not None:
-                return np.asarray(lift_ref, dtype=float).reshape(-1).copy()
-        squeeze_ref = ekf_ctx.get("squeeze_end_obj_qpos")
-        if squeeze_ref is not None:
-            return np.asarray(squeeze_ref, dtype=float).reshape(-1).copy()
-        return self._physical_pre_obj_qpos(
-            ekf_ctx["pre_obj_qpos"], self.configs.setting
+            if lift_ref is None:
+                raise ValueError(
+                    "ekf_init_nominal_ref=lift_end but lift_end_obj_qpos is unavailable"
+                )
+            return np.asarray(lift_ref, dtype=float).reshape(-1).copy(), "lift_end"
+        if ref_key == "squeeze_end":
+            squeeze_ref = ekf_ctx.get("squeeze_end_obj_qpos")
+            if squeeze_ref is None:
+                raise ValueError(
+                    "ekf_init_nominal_ref=squeeze_end but squeeze_end_obj_qpos is unavailable"
+                )
+            return np.asarray(squeeze_ref, dtype=float).reshape(-1).copy(), "squeeze_end"
+        raise ValueError(
+            f"Unsupported ekf_init_nominal_ref={ref_key!r}, "
+            "expected grasp | pre_grasp | lift_end | squeeze_end"
         )
 
     @staticmethod
@@ -125,6 +157,9 @@ class tabletopArmEval(BaseEval):
         ekf_logger = None
         ekf_stage = getattr(self.configs.task, "ekf_input_stage", "post_lift")
         run_ekf_smoke = getattr(self.configs.task, "ekf_smoke_enable", False)
+        run_ekf_eval = bool(getattr(self.configs.task, "ekf_pose_eval_enable", True))
+        log_ekf_inputs = bool(getattr(self.configs.task, "ekf_input_debug", False))
+        run_ekf_callback = bool(run_ekf_smoke or run_ekf_eval)
         ekf_ctx = {
             "state": None,
             "P": None,
@@ -138,6 +173,7 @@ class tabletopArmEval(BaseEval):
             "pre_obj_qpos": np.asarray(pre_obj_qpos, dtype=float).reshape(-1).copy(),
             "squeeze_end_obj_qpos": None,
             "lift_end_obj_qpos": None,
+            "q_prev": None,
         }
         if getattr(self.configs.task, "ekf_pose_eval_enable", True):
             pose_output_dir = str(
@@ -152,17 +188,20 @@ class tabletopArmEval(BaseEval):
                 output_dir=pose_output_dir,
                 realtime_plot=bool(getattr(self.configs.task, "ekf_pose_eval_realtime_plot", False)),
             )
-        if getattr(self.configs.task, "ekf_input_debug", False):
+        if run_ekf_callback or log_ekf_inputs:
             ekf_logger = EkfOnlineInputLogger(
-                print_every=getattr(self.configs.task, "ekf_input_print_every", 20)
+                print_every=(
+                    int(getattr(self.configs.task, "ekf_input_print_every", 20))
+                    if log_ekf_inputs
+                    else 10**9
+                )
             )
-            if ekf_stage == "all":
-                if run_ekf_smoke:
-                    self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
-                        mj, ekf_logger, ekf_ctx
-                    )
-                else:
-                    self.mj_ho.step_callback = ekf_logger.on_step
+            if ekf_stage == "all" and run_ekf_callback:
+                self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
+                    mj, ekf_logger, ekf_ctx
+                )
+            elif ekf_stage == "all" and log_ekf_inputs:
+                self.mj_ho.step_callback = ekf_logger.on_step
         try:
             # 1. Set object gravity (legacy mode uses equivalent external force when gravity is disabled).
             if getattr(self.configs.task, "use_external_gravity", True):
@@ -216,13 +255,13 @@ class tabletopArmEval(BaseEval):
 
             # 7. Hold-and-observe stage after lift.
             # -1 means "keep printing while viewer is open".
+            if ekf_logger is not None and ekf_stage == "post_lift" and run_ekf_callback:
+                self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
+                    mj, ekf_logger, ekf_ctx
+                )
+            elif ekf_logger is not None and ekf_stage == "post_lift" and log_ekf_inputs:
+                self.mj_ho.step_callback = ekf_logger.on_step
             if ekf_logger is not None and ekf_stage == "post_lift":
-                if run_ekf_smoke:
-                    self.mj_ho.step_callback = lambda mj: self._ekf_debug_callback(
-                        mj, ekf_logger, ekf_ctx
-                    )
-                else:
-                    self.mj_ho.step_callback = ekf_logger.on_step
                 post_lift_steps = int(
                     getattr(self.configs.task, "ekf_input_post_lift_steps", 2000)
                 )
@@ -273,18 +312,13 @@ class tabletopArmEval(BaseEval):
                     rot_noise = rng.normal(0.0, np.deg2rad(sigma_rot_deg), size=3)
                     x0_hint[3:6] = x0_hint[3:6] + rot_noise
             elif init_mode == "nominal":
-                nominal_ref = self._resolve_nominal_obj_qpos_ref(ekf_ctx)
+                nominal_ref, nominal_ref_name = self._resolve_nominal_obj_qpos_ref(
+                    ekf_ctx
+                )
                 if nominal_ref.shape[0] < 7:
                     raise ValueError(
                         f"nominal_obj_qpos_ref must have at least 7 dims, got {nominal_ref.shape}"
                     )
-                nominal_ref_name = "pre_grasp_physical"
-                if ekf_ctx.get("lift_end_obj_qpos") is not None and getattr(
-                    self.configs.task, "ekf_input_stage", "post_lift"
-                ) == "post_lift":
-                    nominal_ref_name = "lift_end"
-                elif ekf_ctx.get("squeeze_end_obj_qpos") is not None:
-                    nominal_ref_name = "squeeze_end"
                 x0_hint[:3] = nominal_ref[:3]
                 x0_hint[3:6] = quat_wxyz_to_rotvec(nominal_ref[3:7])
                 sigma_pos = float(
@@ -322,6 +356,18 @@ class tabletopArmEval(BaseEval):
             ekf_ctx["state"] = state0
             ekf_ctx["P"] = P0
             ekf_ctx["inited"] = True
+            pose_metrics = ekf_ctx.get("pose_metrics")
+            if pose_metrics is not None:
+                nominal_ref_tag = ""
+                if init_mode == "nominal":
+                    nominal_ref_tag = str(nominal_ref_name)
+                pose_metrics.record_init(
+                    sim_step=int(ekf_ctx["step"]),
+                    x0_est6=state0.x,
+                    x_gt7=x_gt,
+                    init_mode=init_mode,
+                    nominal_ref=nominal_ref_tag,
+                )
 
         state_prev: InhandState = ekf_ctx["state"]
         P_prev: np.ndarray = ekf_ctx["P"]
@@ -341,6 +387,7 @@ class tabletopArmEval(BaseEval):
             J_pinv,
             xi_new_init,
             f_new_init,
+            obj_face_ids,
             next_cache,
             match_stats,
             match_events,
@@ -420,17 +467,76 @@ class tabletopArmEval(BaseEval):
         no_contact_steps_thr = int(
             getattr(self.configs.task, "ekf_no_contact_steps_threshold", 8)
         )
+        low_u_hold = False
         if ekf_ctx["no_contact_streak"] >= max(1, no_contact_steps_thr):
             tau_r_scale = float(
                 getattr(self.configs.task, "ekf_no_contact_tau_R_scale", 100.0)
             )
             R_t[m:, m:] *= tau_r_scale
+        else:
+            u_norm = float(np.linalg.norm(u_t))
+            low_u_thr = float(
+                getattr(self.configs.task, "ekf_low_u_norm_threshold", 0.0)
+            )
+            low_u_hold = (
+                low_u_thr > 0.0
+                and u_norm < low_u_thr
+                and state_work.n_contacts > 0
+            )
+            low_u_skip_update = bool(
+                getattr(self.configs.task, "ekf_low_u_skip_update", False)
+            )
+            if low_u_hold and not low_u_skip_update:
+                hold_r_scale = float(
+                    getattr(
+                        self.configs.task,
+                        "ekf_low_u_R_scale",
+                        getattr(self.configs.task, "ekf_low_u_tau_R_scale", 50.0),
+                    )
+                )
+                R_t *= hold_r_scale
         J_obs = np.asarray(J_obs_contact, dtype=float)
         if J_obs.shape != (3 * state_work.n_contacts, m):
             raise RuntimeError(
                 f"J_obs shape mismatch, expected {(3 * state_work.n_contacts, m)}, got {J_obs.shape}"
             )
         hq_impl = None
+        use_state_hq_geom = bool(
+            getattr(self.configs.task, "ekf_hq_use_state_geometry", True)
+        )
+        if use_state_hq_geom and state_work.n_contacts > 0:
+            adapter = self._get_ekf_geom_adapter(mj_ho)
+            face_ids_step = np.asarray(obj_face_ids, dtype=np.int32).reshape(-1)
+            c_f_step = np.asarray(c_f_prev, dtype=float)
+            J_pinv_step = np.asarray(J_pinv, dtype=float)
+
+            def _hq_from_state(state_hq: InhandState, q_prev_hq: np.ndarray) -> np.ndarray:
+                n_hq = state_hq.n_contacts
+                if face_ids_step.shape[0] != n_hq:
+                    raise RuntimeError(
+                        f"obj_face_ids length {face_ids_step.shape[0]} != state contacts {n_hq}"
+                    )
+                xi_hq = state_hq.xi.reshape(n_hq, 2)
+                c_obj_state = adapter.object_contact_points_from_state(
+                    state_hq.x, xi_hq, face_ids_step
+                )
+                return h_q_eq8_11(
+                    state=state_hq,
+                    q_prev=q_prev_hq,
+                    J_pinv=J_pinv_step,
+                    c_obj=c_obj_state,
+                    c_f_prev=c_f_step,
+                )
+
+            hq_impl = _hq_from_state
+        q_for_hq = ekf_ctx["q_prev"]
+        if q_for_hq is None:
+            # First EKF step: no t-1 yet, fall back to current measurement.
+            q_for_hq = q
+        else:
+            q_for_hq = np.asarray(q_for_hq, dtype=float).reshape(-1)
+            if q_for_hq.shape[0] != q.shape[0]:
+                q_for_hq = q
 
         step_res = run_one_step_smoke(
             state_prev=state_work,
@@ -442,7 +548,7 @@ class tabletopArmEval(BaseEval):
             J_motion=J_motion,
             Q_t=Q_work,
             R_t=R_t,
-            q_prev=q,
+            q_prev=q_for_hq,
             J_obs=J_obs,
             contact_normals_obj=contact_normals_obj,
             hq_impl=hq_impl,
@@ -450,10 +556,18 @@ class tabletopArmEval(BaseEval):
             c_obj=c_obj,
             c_f_prev=c_f_prev,
             jac_eps=1e-6,
+            skip_update=bool(
+                low_u_hold
+                and getattr(self.configs.task, "ekf_low_u_skip_update", False)
+            ),
+            use_analytic_h_tau=bool(
+                getattr(self.configs.task, "ekf_use_analytic_h_tau", True)
+            ),
         )
 
         ekf_ctx["state"] = InhandState.unpack(step_res.ekf_update.y_next)
         ekf_ctx["P"] = step_res.ekf_update.P_next
+        ekf_ctx["q_prev"] = np.asarray(q, dtype=float).reshape(-1).copy()
         est_pose7 = self._x6_to_pose7(ekf_ctx["state"].x)
         if bool(getattr(self.configs.task, "ekf_pose_mesh_overlay_enable", False)):
             mj_ho.set_est_obj_pose(est_pose7)

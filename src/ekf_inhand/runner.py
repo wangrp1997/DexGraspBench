@@ -8,6 +8,7 @@ from .ekf_core import ekf_step_filterpy
 from .motion_model import jacobian_F_eq16
 from .motion_model import predict_covariance_eq15
 from .motion_model import predict_state_eq6
+from .observation_model import H_full_eq19_hybrid
 from .observation_model import H_full_eq19_numeric
 from .observation_model import h_full_eq7
 from .state import InhandState
@@ -38,6 +39,8 @@ def run_one_step_smoke(
     c_obj: np.ndarray | None = None,
     c_f_prev: np.ndarray | None = None,
     jac_eps: float = 1e-6,
+    skip_update: bool = False,
+    use_analytic_h_tau: bool = True,
 ) -> RunnerStepResult:
     """
     Minimal runner that chains:
@@ -67,6 +70,36 @@ def run_one_step_smoke(
     )
     P_pred = predict_covariance_eq15(P_prev=P_prev, F_t=F_t, Q_t=Q_t)
 
+    if skip_update:
+        y_pred = state_pred.pack()
+        dim_z = z_t.shape[0]
+
+        def _h_vec_skip(y_vec: np.ndarray) -> np.ndarray:
+            s = InhandState.unpack(y_vec)
+            return h_full_eq7(
+                state=s,
+                q_prev=q_prev,
+                J=J_obs,
+                contact_normals_obj=contact_normals_obj,
+                hq_impl=hq_impl,
+                J_pinv=J_pinv,
+                c_obj=c_obj,
+                c_f_prev=c_f_prev,
+            )
+
+        h_pred = np.asarray(_h_vec_skip(y_pred), dtype=float).reshape(-1)
+        innovation = np.asarray(z_t, dtype=float).reshape(-1) - h_pred
+        return RunnerStepResult(
+            state_pred=state_pred,
+            P_pred=P_pred,
+            ekf_update=EkfStepResult(
+                y_next=y_pred.copy(),
+                P_next=P_pred.copy(),
+                innovation=innovation,
+                K=np.zeros((y_pred.shape[0], dim_z), dtype=float),
+            ),
+        )
+
     # 3) measurement model wrappers on vector state
     def _h_vec(y_vec: np.ndarray) -> np.ndarray:
         s = InhandState.unpack(y_vec)
@@ -81,7 +114,18 @@ def run_one_step_smoke(
             c_f_prev=c_f_prev,
         )
 
+    m_q = int(np.asarray(q_prev, dtype=float).reshape(-1).shape[0])
+
     def _H_vec(y_vec: np.ndarray) -> np.ndarray:
+        if use_analytic_h_tau:
+            return H_full_eq19_hybrid(
+                y_vec=y_vec,
+                h_func=_h_vec,
+                J_obs=J_obs,
+                contact_normals_obj=contact_normals_obj,
+                m_q=m_q,
+                eps=jac_eps,
+            )
         return H_full_eq19_numeric(y_vec=y_vec, h_func=_h_vec, eps=jac_eps)
 
     step_res = ekf_step_filterpy(

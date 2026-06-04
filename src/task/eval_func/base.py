@@ -32,6 +32,14 @@ class BaseEval:
         )
 
         # Build mj_spec
+        viewer_camera = None
+        if getattr(configs.task, "viewer_cam_lookat", None) is not None:
+            viewer_camera = {
+                "lookat": np.asarray(configs.task.viewer_cam_lookat, dtype=float),
+                "distance": getattr(configs.task, "viewer_cam_distance", None),
+                "azimuth": getattr(configs.task, "viewer_cam_azimuth", None),
+                "elevation": getattr(configs.task, "viewer_cam_elevation", None),
+            }
         self.mj_ho = MjHO(
             obj_path=self.grasp_data["obj_path"],
             obj_scale=self.grasp_data["obj_scale"],
@@ -63,6 +71,7 @@ class BaseEval:
                 ),
                 dtype=float,
             ),
+            viewer_camera=viewer_camera,
         )
 
         if self.configs.task.debug_viewer or self.configs.task.debug_render:

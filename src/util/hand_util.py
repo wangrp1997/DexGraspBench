@@ -10,6 +10,16 @@ import transforms3d.quaternions as tq
 from .rot_util import interplote_pose, interplote_qpos
 
 
+# Passive viewer default free camera. Edit here, or override via task yaml:
+#   viewer_cam_lookat / viewer_cam_distance / viewer_cam_azimuth / viewer_cam_elevation
+DEFAULT_VIEWER_CAMERA = {
+    "lookat": [0.72, 0.0, 0.12],
+    "distance": 1.6,
+    "azimuth": 132.0,
+    "elevation": -22.0,
+}
+
+
 class MjHO:
 
     hand_prefix: str = "child-"
@@ -30,6 +40,7 @@ class MjHO:
         pose_overlay_enable=False,
         pose_overlay_gt_rgba=None,
         pose_overlay_est_rgba=None,
+        viewer_camera=None,
     ):
         self.hand_mocap = hand_mocap
         self.spec = mujoco.MjSpec()
@@ -77,6 +88,11 @@ class MjHO:
                     bodyname1="world", bodyname2=f"{self.hand_prefix}{body_name}"
                 )
 
+        # MuJoCo auto arena (~15M) is too small once EKF pose overlay duplicates
+        # object visual geoms and adds a second free joint (mj_forward at t=0).
+        if self.pose_overlay_enable:
+            self.spec.memory = 64 * 1024 * 1024
+
         # Get ready for simulation
         self.model = self.spec.compile()
         self.data = mujoco.MjData(self.model)
@@ -113,6 +129,7 @@ class MjHO:
         self.debug_render = None
         if debug_viewer:
             self.debug_viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            self._apply_viewer_camera(viewer_camera)
             self.debug_viewer.sync()
 
         if debug_render:
@@ -125,6 +142,34 @@ class MjHO:
             self.debug_images = []
         self.step_callback = None
         return
+
+    @staticmethod
+    def _resolve_viewer_camera(viewer_camera):
+        cam = dict(DEFAULT_VIEWER_CAMERA)
+        if viewer_camera is None:
+            return cam
+        for key in ("lookat", "distance", "azimuth", "elevation"):
+            if key in viewer_camera and viewer_camera[key] is not None:
+                cam[key] = viewer_camera[key]
+        return cam
+
+    def _apply_viewer_camera(self, viewer_camera=None):
+        if self.debug_viewer is None:
+            return
+        cam_cfg = self._resolve_viewer_camera(viewer_camera)
+        cam = self.debug_viewer.cam
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.lookat[:] = np.asarray(cam_cfg["lookat"], dtype=float).reshape(3)
+        cam.distance = float(cam_cfg["distance"])
+        cam.azimuth = float(cam_cfg["azimuth"])
+        cam.elevation = float(cam_cfg["elevation"])
+        print(
+            "[VIEWER-CAM] "
+            f"lookat={cam.lookat.tolist()} "
+            f"distance={cam.distance:.3f} "
+            f"azimuth={cam.azimuth:.1f} "
+            f"elevation={cam.elevation:.1f}"
+        )
 
     def _add_hand(self, xml_path, mocap_base):
         # Read hand xml

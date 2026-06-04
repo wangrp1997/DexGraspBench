@@ -140,6 +140,7 @@ def build_hq_inputs_with_contact_matching(
     n_obj_lst = []
     J_blocks = []
     xi_obj_curr_lst = []
+    obj_face_ids_lst = []
     f_curr_lst = []
     next_contact_cache: ContactCache = {}
     matched_count = 0
@@ -247,6 +248,7 @@ def build_hq_inputs_with_contact_matching(
                     obj_rot = np.asarray(data.xmat[obj_body_id], dtype=float).reshape(3, 3)
                     c_obj_local = obj_rot.T @ (c_pos - obj_pos)
                     xi_obj = c_obj_local[:2].copy()
+                    obj_face_id_curr = int(obj_face_hint)
                 if hand_surface_mapper is not None:
                     xi_f_curr, n_f_curr, face_id_curr = hand_surface_mapper(
                         hand_body_id, c_pos, n_obj, hand_face_hint
@@ -332,6 +334,7 @@ def build_hq_inputs_with_contact_matching(
         n_obj_lst.append(n_obj)
         J_blocks.append(J_block)
         xi_obj_curr_lst.append(xi_obj)
+        obj_face_ids_lst.append(int(obj_face_id_curr))
         f_curr_lst.append(f_j)
         next_contact_cache.setdefault(key, []).append(
             {
@@ -373,6 +376,7 @@ def build_hq_inputs_with_contact_matching(
             np.zeros((m, 0), dtype=float),
             np.zeros((0,), dtype=float),
             np.zeros((0,), dtype=float),
+            np.zeros((0,), dtype=np.int32),
             {},
             stats,
             events,
@@ -384,6 +388,7 @@ def build_hq_inputs_with_contact_matching(
     J_obs = np.concatenate(J_blocks, axis=0)  # (3n, m)
     J_pinv = np.linalg.pinv(J_obs)  # (m, 3n)
     xi_obj_curr = np.stack(xi_obj_curr_lst, axis=0)  # (n, 2)
+    obj_face_ids = np.asarray(obj_face_ids_lst, dtype=np.int32)  # (n,)
     f_curr = np.asarray(f_curr_lst, dtype=float).reshape(-1)  # (n,)
     if len(events.new_curr_idx) > 0:
         idx = np.asarray(events.new_curr_idx, dtype=np.int32)
@@ -400,6 +405,7 @@ def build_hq_inputs_with_contact_matching(
         J_pinv,
         xi_new_init,
         f_new_init,
+        obj_face_ids,
         next_contact_cache,
         stats,
         events,

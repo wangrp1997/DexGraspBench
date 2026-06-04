@@ -255,6 +255,71 @@ def h_full_eq7(
     return np.concatenate([q_hat, tau_hat], axis=0)
 
 
+def H_tau_eq19_analytic(
+    n_contacts: int,
+    dim_y: int,
+    J_obs: np.ndarray,
+    contact_normals_obj: np.ndarray,
+    m_tau: int,
+) -> np.ndarray:
+    """
+    Analytic ∂h_tau/∂y for Eq.(12)(13) when J and object normals are held fixed.
+
+    Only force columns ∂h_tau/∂f_i are nonzero:
+      h_tau = J^T [n_1 f_1, ..., n_n f_n]^T  =>  ∂h_tau/∂f_i = J^T[:, 3i:3i+3] n_i
+    """
+    n = int(n_contacts)
+    J = np.asarray(J_obs, dtype=float)
+    normals = np.asarray(contact_normals_obj, dtype=float)
+    H_tau = np.zeros((m_tau, dim_y), dtype=float)
+    if n == 0:
+        return H_tau
+    if normals.shape != (n, 3):
+        raise ValueError(
+            f"contact_normals_obj must have shape {(n, 3)}, got {normals.shape}"
+        )
+    if J.shape[0] != 3 * n:
+        raise ValueError(
+            f"J first dim must be 3n={3*n} for n={n} contacts, got {J.shape[0]}"
+        )
+    if J.shape[1] != m_tau:
+        raise ValueError(
+            f"J second dim must be m_tau={m_tau}, got {J.shape[1]}"
+        )
+    for i in range(n):
+        col_f = 6 + 2 * n + i
+        H_tau[:, col_f] = J.T[:, 3 * i : 3 * i + 3] @ normals[i]
+    return H_tau
+
+
+def H_full_eq19_hybrid(
+    y_vec: np.ndarray,
+    h_func: Callable[[np.ndarray], np.ndarray],
+    J_obs: np.ndarray,
+    contact_normals_obj: np.ndarray,
+    m_q: int,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    Hybrid Eq.(19) Jacobian: numeric for h_q rows, analytic for h_tau rows (w.r.t. f).
+    """
+    y = np.asarray(y_vec, dtype=float).reshape(-1)
+    state = InhandState.unpack(y)
+    H = H_full_eq19_numeric(y_vec=y, h_func=h_func, eps=eps)
+    h0 = np.asarray(h_func(y), dtype=float).reshape(-1)
+    m_tau = h0.shape[0] - int(m_q)
+    if m_tau > 0 and state.n_contacts > 0:
+        H_tau = H_tau_eq19_analytic(
+            n_contacts=state.n_contacts,
+            dim_y=y.shape[0],
+            J_obs=J_obs,
+            contact_normals_obj=contact_normals_obj,
+            m_tau=m_tau,
+        )
+        H[int(m_q) :, :] = H_tau
+    return H
+
+
 def H_full_eq19_numeric(
     y_vec: np.ndarray,
     h_func: Callable[[np.ndarray], np.ndarray],

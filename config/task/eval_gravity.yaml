@@ -4,6 +4,11 @@ miu_coef: [0.6, 0.02]
 debug_render: False
 debug_viewer: False
 debug_viewer_autoclose: False  # batch-only: True to skip manual wait_until_viewer_closed
+# MuJoCo passive viewer free camera (lookat xyz, spherical distance/azimuth/elevation)
+viewer_cam_lookat: [0.72, 0.0, 0.12]
+viewer_cam_distance: 1.6
+viewer_cam_azimuth: 132.0
+viewer_cam_elevation: -22.0
 debug_dir: ${save_dir}/debug
 
 # Real-gravity variant:
@@ -22,22 +27,28 @@ ekf_step_every: 2   # run EKF callback every N sim steps (>=1)
 ekf_contact_rho_plus: 0.10   # Eq.(21)(22) add threshold for w_j
 ekf_contact_rho_minus: 0.03  # Eq.(25) remove threshold for w_j (must be < rho_plus)
 ekf_contact_score_eps: 1e-9  # epsilon for w_j = f_j/sqrt(d_j)
-ekf_q_x: 5e-4   # group-2: process noise for x(6) block
+ekf_q_x: 1e-4   # group-2: process noise for x(6) block (lower -> less hold drift)
 ekf_q_xi: 3e-3  # group-3: process noise for xi(2n) block
 ekf_q_f: 1e-2   # group-3: process noise for f(n) block
 ekf_r_q: 2e-3   # group-2: measurement noise for q(m) block
 ekf_r_tau: 5e-2 # group-3: measurement noise for tau(m) block
+ekf_low_u_norm_threshold: 0.025   # |u|=||qvel|| below this -> quasi-static hold
+ekf_low_u_R_scale: 150.0   # multiply entire R (q and tau) when |u| is low
+ekf_low_u_skip_update: True   # True: predict-only (no measurement update) when |u| is low
+ekf_hq_use_state_geometry: True   # h_q: c_obj from state x/xi (not sim contact.pos)
+ekf_use_analytic_h_tau: True   # H: analytic ∂h_tau/∂f, numeric ∂h_q/∂y
 ekf_no_contact_steps_threshold: 8   # after N no-contact EKF steps, weaken torque update
 ekf_no_contact_tau_R_scale: 500.0   # multiply R_tau block when in prolonged no-contact
 ekf_audit_enable: True   # run Eq.(24)(25) index-consistency audit for y/P/Q/contact mapping
 ekf_audit_every: 20   # audit every N EKF callback steps
 ekf_g_sanity_enable: True   # print Eq.(6) G/J_motion sanity metrics in [EKF-SMOKE]
 ekf_init_mode: nominal   # gt_exact | gt_perturbed | nominal
+ekf_init_nominal_ref: grasp   # grasp | pre_grasp | lift_end | squeeze_end
 ekf_init_seed: 0
 ekf_init_gt_pos_sigma: 0.015   # meters, std for GT-perturbed init position
 ekf_init_gt_rot_sigma_deg: 4.0  # degrees, std for GT-perturbed init orientation (rotvec)
-ekf_init_nominal_pos_sigma: 0.03   # meters, std around pre_obj_qpos position
-ekf_init_nominal_rot_sigma_deg: 12.0  # degrees, std around pre_obj_qpos orientation
+ekf_init_nominal_pos_sigma: 0.03   # meters, std around nominal ref position
+ekf_init_nominal_rot_sigma_deg: 12.0  # degrees, std around nominal init orientation (rotvec)
 ekf_pose_eval_enable: True   # print EKF pose-estimation error against MuJoCo GT
 ekf_pose_eval_print_every: 50  # [EKF-METRIC] print period
 ekf_pose_eval_realtime_plot: True  # True to show realtime error curves (matplotlib)
